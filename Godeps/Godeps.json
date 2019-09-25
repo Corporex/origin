@@ -10,8 +10,8 @@
 		{
 			"REBASE TODO": "git describe --long --tags --abbrev=7",
 			"ImportPath": "k8s.io/kubernetes/pkg/api",
-			"Comment": "v1.13.4-138-g41dc99c",
-			"Rev": "41dc99c06e1cf9b9074b00a69902363cefb0538c"
+			"Comment": "v1.16.0-beta.2-63-g2f054b7",
+			"Rev": "2f054b7646dc9e98f6dea458d2fb65e1d2c1f731"
 		}
 	]
 }

@@ -1,3 +1,5 @@
+// +build !providerless
+
 /*
 Copyright 2016 The Kubernetes Authors.
 
@@ -23,13 +25,14 @@ import (
 	"strings"
 	"time"
 
-	v1 "k8s.io/api/core/v1"
+	"k8s.io/api/core/v1"
 	cloudprovider "k8s.io/cloud-provider"
+	volumehelpers "k8s.io/cloud-provider/volume/helpers"
 	"k8s.io/klog"
-	"k8s.io/kubernetes/pkg/cloudprovider/providers/vsphere"
-	"k8s.io/kubernetes/pkg/cloudprovider/providers/vsphere/vclib"
 	"k8s.io/kubernetes/pkg/volume"
 	volumeutil "k8s.io/kubernetes/pkg/volume/util"
+	"k8s.io/legacy-cloud-providers/vsphere"
+	"k8s.io/legacy-cloud-providers/vsphere/vclib"
 )
 
 const (
@@ -70,20 +73,11 @@ type VolumeSpec struct {
 	Fstype            string
 	StoragePolicyID   string
 	StoragePolicyName string
-}
-
-func verifyDevicePath(path string) (string, error) {
-	if pathExists, err := volumeutil.PathExists(path); err != nil {
-		return "", fmt.Errorf("Error checking if path exists: %v", err)
-	} else if pathExists {
-		return path, nil
-	}
-
-	return "", nil
+	Labels            map[string]string
 }
 
 // CreateVolume creates a vSphere volume.
-func (util *VsphereDiskUtil) CreateVolume(v *vsphereVolumeProvisioner) (volSpec *VolumeSpec, err error) {
+func (util *VsphereDiskUtil) CreateVolume(v *vsphereVolumeProvisioner, selectedNode *v1.Node, selectedZone []string) (volSpec *VolumeSpec, err error) {
 	var fstype string
 	cloud, err := getCloudProvider(v.plugin.host.GetCloudProvider())
 	if err != nil {
@@ -91,9 +85,8 @@ func (util *VsphereDiskUtil) CreateVolume(v *vsphereVolumeProvisioner) (volSpec 
 	}
 
 	capacity := v.options.PVC.Spec.Resources.Requests[v1.ResourceName(v1.ResourceStorage)]
-	volSizeBytes := capacity.Value()
 	// vSphere works with KiB, but its minimum allocation unit is 1 MiB
-	volSizeMiB, err := volumeutil.RoundUpSizeInt(volSizeBytes, 1024*1024)
+	volSizeMiB, err := volumehelpers.RoundUpToMiBInt(capacity)
 	if err != nil {
 		return nil, err
 	}
@@ -105,6 +98,8 @@ func (util *VsphereDiskUtil) CreateVolume(v *vsphereVolumeProvisioner) (volSpec 
 		Name:       name,
 	}
 
+	volumeOptions.Zone = selectedZone
+	volumeOptions.SelectedNode = selectedNode
 	// Apply Parameters (case-insensitive). We leave validation of
 	// the values to the cloud provider.
 	for parameter, value := range v.options.Parameters {
@@ -148,12 +143,17 @@ func (util *VsphereDiskUtil) CreateVolume(v *vsphereVolumeProvisioner) (volSpec 
 	if err != nil {
 		return nil, err
 	}
+	labels, err := cloud.GetVolumeLabels(vmDiskPath)
+	if err != nil {
+		return nil, err
+	}
 	volSpec = &VolumeSpec{
 		Path:              vmDiskPath,
 		Size:              volSizeKiB,
 		Fstype:            fstype,
 		StoragePolicyName: volumeOptions.StoragePolicyName,
 		StoragePolicyID:   volumeOptions.StoragePolicyID,
+		Labels:            labels,
 	}
 	klog.V(2).Infof("Successfully created vsphere volume %s", name)
 	return volSpec, nil

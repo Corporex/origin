@@ -20,9 +20,6 @@ package options
 // This should probably be part of some configuration fed into the build for a
 // given binary target.
 import (
-	// Cloud providers
-	_ "k8s.io/kubernetes/pkg/cloudprovider/providers"
-
 	// Admission policies
 	"k8s.io/kubernetes/plugin/pkg/admission/admit"
 	"k8s.io/kubernetes/plugin/pkg/admission/alwayspullimages"
@@ -44,6 +41,7 @@ import (
 	"k8s.io/kubernetes/plugin/pkg/admission/podtolerationrestriction"
 	podpriority "k8s.io/kubernetes/plugin/pkg/admission/priority"
 	"k8s.io/kubernetes/plugin/pkg/admission/resourcequota"
+	"k8s.io/kubernetes/plugin/pkg/admission/runtimeclass"
 	"k8s.io/kubernetes/plugin/pkg/admission/security/podsecuritypolicy"
 	"k8s.io/kubernetes/plugin/pkg/admission/securitycontext/scdeny"
 	"k8s.io/kubernetes/plugin/pkg/admission/serviceaccount"
@@ -54,7 +52,6 @@ import (
 
 	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/apiserver/pkg/admission"
-	"k8s.io/apiserver/pkg/admission/plugin/initialization"
 	"k8s.io/apiserver/pkg/admission/plugin/namespace/lifecycle"
 	mutatingwebhook "k8s.io/apiserver/pkg/admission/plugin/webhook/mutating"
 	validatingwebhook "k8s.io/apiserver/pkg/admission/plugin/webhook/validating"
@@ -92,15 +89,15 @@ var AllOrderedPlugins = []string{
 	gc.PluginName,                           // OwnerReferencesPermissionEnforcement
 	resize.PluginName,                       // PersistentVolumeClaimResize
 	mutatingwebhook.PluginName,              // MutatingAdmissionWebhook
-	initialization.PluginName,               // Initializers
 	validatingwebhook.PluginName,            // ValidatingAdmissionWebhook
+	runtimeclass.PluginName,                 //RuntimeClass
 	resourcequota.PluginName,                // ResourceQuota
 	deny.PluginName,                         // AlwaysDeny
 }
 
 // RegisterAllAdmissionPlugins registers all admission plugins and
 // sets the recommended plugins order.
-func registerAllAdmissionPlugins(plugins *admission.Plugins) {
+func RegisterAllAdmissionPlugins(plugins *admission.Plugins) {
 	admit.Register(plugins) // DEPRECATED as no real meaning
 	alwayspullimages.Register(plugins)
 	antiaffinity.Register(plugins)
@@ -116,10 +113,11 @@ func registerAllAdmissionPlugins(plugins *admission.Plugins) {
 	exists.Register(plugins)
 	noderestriction.Register(plugins)
 	nodetaint.Register(plugins)
-	label.Register(plugins) // DEPRECATED in favor of NewPersistentVolumeLabelController in CCM
+	label.Register(plugins) // DEPRECATED, future PVs should not rely on labels for zone topology
 	podnodeselector.Register(plugins)
 	podpreset.Register(plugins)
 	podtolerationrestriction.Register(plugins)
+	runtimeclass.Register(plugins)
 	resourcequota.Register(plugins)
 	podsecuritypolicy.Register(plugins)
 	podpriority.Register(plugins)
@@ -131,25 +129,27 @@ func registerAllAdmissionPlugins(plugins *admission.Plugins) {
 }
 
 // DefaultOffAdmissionPlugins get admission plugins off by default for kube-apiserver.
-func defaultOffAdmissionPlugins() sets.String {
+func DefaultOffAdmissionPlugins() sets.String {
 	defaultOnPlugins := sets.NewString(
-		lifecycle.PluginName,                //NamespaceLifecycle
-		limitranger.PluginName,              //LimitRanger
-		serviceaccount.PluginName,           //ServiceAccount
-		setdefault.PluginName,               //DefaultStorageClass
-		resize.PluginName,                   //PersistentVolumeClaimResize
-		defaulttolerationseconds.PluginName, //DefaultTolerationSeconds
-		mutatingwebhook.PluginName,          //MutatingAdmissionWebhook
-		validatingwebhook.PluginName,        //ValidatingAdmissionWebhook
-		resourcequota.PluginName,            //ResourceQuota
+		lifecycle.PluginName,                    //NamespaceLifecycle
+		limitranger.PluginName,                  //LimitRanger
+		serviceaccount.PluginName,               //ServiceAccount
+		setdefault.PluginName,                   //DefaultStorageClass
+		resize.PluginName,                       //PersistentVolumeClaimResize
+		defaulttolerationseconds.PluginName,     //DefaultTolerationSeconds
+		mutatingwebhook.PluginName,              //MutatingAdmissionWebhook
+		validatingwebhook.PluginName,            //ValidatingAdmissionWebhook
+		resourcequota.PluginName,                //ResourceQuota
+		storageobjectinuseprotection.PluginName, //StorageObjectInUseProtection
+		podpriority.PluginName,                  //PodPriority
 	)
-
-	if utilfeature.DefaultFeatureGate.Enabled(features.PodPriority) {
-		defaultOnPlugins.Insert(podpriority.PluginName) //PodPriority
-	}
 
 	if utilfeature.DefaultFeatureGate.Enabled(features.TaintNodesByCondition) {
 		defaultOnPlugins.Insert(nodetaint.PluginName) //TaintNodesByCondition
+	}
+
+	if utilfeature.DefaultFeatureGate.Enabled(features.RuntimeClass) {
+		defaultOnPlugins.Insert(runtimeclass.PluginName) //RuntimeClass
 	}
 
 	return sets.NewString(AllOrderedPlugins...).Difference(defaultOnPlugins)

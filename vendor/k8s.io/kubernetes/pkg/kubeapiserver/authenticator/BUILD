@@ -24,6 +24,8 @@ go_library(
         "//staging/src/k8s.io/apiserver/pkg/authentication/token/cache:go_default_library",
         "//staging/src/k8s.io/apiserver/pkg/authentication/token/tokenfile:go_default_library",
         "//staging/src/k8s.io/apiserver/pkg/authentication/token/union:go_default_library",
+        "//staging/src/k8s.io/apiserver/pkg/server:go_default_library",
+        "//staging/src/k8s.io/apiserver/pkg/server/certs:go_default_library",
         "//staging/src/k8s.io/apiserver/pkg/util/feature:go_default_library",
         "//staging/src/k8s.io/apiserver/plugin/pkg/authenticator/password/passwordfile:go_default_library",
         "//staging/src/k8s.io/apiserver/plugin/pkg/authenticator/request/basicauth:go_default_library",
@@ -31,6 +33,7 @@ go_library(
         "//staging/src/k8s.io/apiserver/plugin/pkg/authenticator/token/webhook:go_default_library",
         "//staging/src/k8s.io/client-go/plugin/pkg/client/auth:go_default_library",
         "//staging/src/k8s.io/client-go/util/cert:go_default_library",
+        "//staging/src/k8s.io/client-go/util/keyutil:go_default_library",
         "//vendor/github.com/go-openapi/spec:go_default_library",
     ],
 )
