@@ -7,10 +7,10 @@ import (
 	"strings"
 	"time"
 
+	projectv1 "github.com/openshift/api/project/v1"
 	networkclient "github.com/openshift/client-go/network/clientset/versioned/typed/network/v1"
-	"github.com/openshift/origin/pkg/network"
+	"github.com/openshift/library-go/pkg/network/networkutils"
 	testexutil "github.com/openshift/origin/test/extended/util"
-	testutil "github.com/openshift/origin/test/util"
 
 	corev1 "k8s.io/api/core/v1"
 	kapierrs "k8s.io/apimachinery/pkg/api/errors"
@@ -279,14 +279,14 @@ func pluginIsolatesNamespaces() bool {
 		return true
 	}
 	// Assume that only the OpenShift SDN "multitenant" plugin isolates by default
-	return networkPluginName() == network.MultiTenantPluginName
+	return networkPluginName() == networkutils.MultiTenantPluginName
 }
 
 func pluginImplementsNetworkPolicy() bool {
 	switch {
 	case os.Getenv("NETWORKING_E2E_NETWORKPOLICY") == "true":
 		return true
-	case networkPluginName() == network.NetworkPolicyPluginName:
+	case networkPluginName() == networkutils.NetworkPolicyPluginName:
 		return true
 	default:
 		// If we can't detect the plugin, we assume it doesn't support
@@ -295,10 +295,9 @@ func pluginImplementsNetworkPolicy() bool {
 	}
 }
 
-func makeNamespaceGlobal(ns *corev1.Namespace) {
-	clientConfig, err := testutil.GetClusterAdminClientConfig(testexutil.KubeConfigPath())
+func makeNamespaceGlobal(oc *testexutil.CLI, ns *corev1.Namespace) {
+	clientConfig := oc.AdminConfig()
 	networkClient := networkclient.NewForConfigOrDie(clientConfig)
-	expectNoError(err)
 	netns, err := networkClient.NetNamespaces().Get(ns.Name, metav1.GetOptions{})
 	expectNoError(err)
 	netns.NetID = 0
@@ -315,7 +314,7 @@ func makeNamespaceScheduleToAllNodes(f *e2e.Framework) {
 		if ns.Annotations == nil {
 			ns.Annotations = make(map[string]string)
 		}
-		ns.Annotations["openshift.io/node-selector"] = ""
+		ns.Annotations[projectv1.ProjectNodeSelector] = ""
 		_, err = f.ClientSet.CoreV1().Namespaces().Update(ns)
 		if err == nil {
 			return
@@ -451,6 +450,20 @@ func InPluginContext(plugins []string, body func()) {
 				}
 				if !found {
 					e2e.Skipf("Not using one of the specified plugins")
+				}
+			})
+
+			body()
+		},
+	)
+}
+
+func InOpenShiftSDNContext(body func()) {
+	Context("when using openshift-sdn",
+		func() {
+			BeforeEach(func() {
+				if networkPluginName() == "" {
+					e2e.Skipf("Not using openshift-sdn")
 				}
 			})
 

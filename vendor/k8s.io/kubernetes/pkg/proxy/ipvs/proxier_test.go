@@ -155,6 +155,7 @@ func NewFakeProxier(ipt utiliptables.Interface, ipvs utilipvs.Interface, ipset u
 		ipvs:              ipvs,
 		ipset:             ipset,
 		clusterCIDR:       "10.0.0.0/24",
+		strictARP:         false,
 		hostname:          testHostname,
 		portsMap:          make(map[utilproxy.LocalPort]utilproxy.Closeable),
 		portMapper:        &fakePortOpener{[]*utilproxy.LocalPort{}},
@@ -1266,18 +1267,32 @@ func TestOnlyLocalLoadBalancing(t *testing.T) {
 	)
 
 	epIP := "10.180.0.1"
+	epIP1 := "10.180.1.1"
+	thisHostname := testHostname
+	otherHostname := "other-hostname"
+
 	makeEndpointsMap(fp,
 		makeTestEndpoints(svcPortName.Namespace, svcPortName.Name, func(ept *v1.Endpoints) {
-			ept.Subsets = []v1.EndpointSubset{{
-				Addresses: []v1.EndpointAddress{{
-					IP:       epIP,
-					NodeName: nil,
-				}},
-				Ports: []v1.EndpointPort{{
-					Name: svcPortName.Port,
-					Port: int32(svcPort),
-				}},
-			}}
+			ept.Subsets = []v1.EndpointSubset{
+				{ // **local** endpoint address, should be added as RS
+					Addresses: []v1.EndpointAddress{{
+						IP:       epIP,
+						NodeName: &thisHostname,
+					}},
+					Ports: []v1.EndpointPort{{
+						Name: svcPortName.Port,
+						Port: int32(svcPort),
+					}}},
+				{ // **remote** endpoint address, should not be added as RS
+					Addresses: []v1.EndpointAddress{{
+						IP:       epIP1,
+						NodeName: &otherHostname,
+					}},
+					Ports: []v1.EndpointPort{{
+						Name: svcPortName.Port,
+						Port: int32(svcPort),
+					}},
+				}}
 		}),
 	)
 
@@ -2908,6 +2923,61 @@ func TestCleanLegacyService(t *testing.T) {
 		t.Errorf("Expected remainingAddrsMap %v, got %v", activeBindAddrs, remainingAddrsMap)
 	}
 
+}
+
+func TestCleanLegacyRealServersExcludeCIDRs(t *testing.T) {
+	ipt := iptablestest.NewFake()
+	ipvs := ipvstest.NewFake()
+	ipset := ipsettest.NewFake(testIPSetVersion)
+	gtm := NewGracefulTerminationManager(ipvs)
+	fp := NewFakeProxier(ipt, ipvs, ipset, nil, []string{"4.4.4.4/32"})
+	fp.gracefuldeleteManager = gtm
+
+	vs := &utilipvs.VirtualServer{
+		Address:   net.ParseIP("4.4.4.4"),
+		Protocol:  string(v1.ProtocolUDP),
+		Port:      56,
+		Scheduler: "rr",
+		Flags:     utilipvs.FlagHashed,
+	}
+
+	fp.ipvs.AddVirtualServer(vs)
+
+	rss := []*utilipvs.RealServer{
+		{
+			Address:      net.ParseIP("10.10.10.10"),
+			Port:         56,
+			ActiveConn:   0,
+			InactiveConn: 0,
+		},
+		{
+			Address:      net.ParseIP("11.11.11.11"),
+			Port:         56,
+			ActiveConn:   0,
+			InactiveConn: 0,
+		},
+	}
+	for _, rs := range rss {
+		fp.ipvs.AddRealServer(vs, rs)
+	}
+
+	fp.netlinkHandle.EnsureDummyDevice(DefaultDummyDevice)
+
+	fp.netlinkHandle.EnsureAddressBind("4.4.4.4", DefaultDummyDevice)
+
+	fp.cleanLegacyService(
+		map[string]bool{},
+		map[string]*utilipvs.VirtualServer{"ipvs0": vs},
+		map[string]bool{"4.4.4.4": true},
+	)
+
+	fp.gracefuldeleteManager.tryDeleteRs()
+
+	remainingRealServers, _ := fp.ipvs.GetRealServers(vs)
+
+	if len(remainingRealServers) != 2 {
+		t.Errorf("Expected number of remaining IPVS real servers after cleanup should be %v. Got %v", 2, len(remainingRealServers))
+	}
 }
 
 func TestCleanLegacyService6(t *testing.T) {

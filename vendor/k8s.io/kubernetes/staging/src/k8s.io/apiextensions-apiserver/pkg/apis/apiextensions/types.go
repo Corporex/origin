@@ -84,6 +84,15 @@ type CustomResourceConversion struct {
 
 	// `webhookClientConfig` is the instructions for how to call the webhook if strategy is `Webhook`.
 	WebhookClientConfig *WebhookClientConfig
+
+	// ConversionReviewVersions is an ordered list of preferred `ConversionReview`
+	// versions the Webhook expects. API server will try to use first version in
+	// the list which it supports. If none of the versions specified in this list
+	// supported by API server, conversion will fail for this object.
+	// If a persisted Webhook configuration specifies allowed versions and does not
+	// include any versions known to the API Server, calls to the webhook will fail.
+	// +optional
+	ConversionReviewVersions []string
 }
 
 // WebhookClientConfig contains the information to make a TLS
@@ -254,6 +263,11 @@ const (
 	NamesAccepted CustomResourceDefinitionConditionType = "NamesAccepted"
 	// Terminating means that the CustomResourceDefinition has been deleted and is cleaning up.
 	Terminating CustomResourceDefinitionConditionType = "Terminating"
+	// KubernetesAPIApprovalPolicyConformant indicates that an API in *.k8s.io or *.kubernetes.io is or is not approved.  For CRDs
+	// outside those groups, this condition will not be set.  For CRDs inside those groups, the condition will
+	// be true if .metadata.annotations["api-approved.kubernetes.io"] is set to a URL, otherwise it will be false.
+	// See https://github.com/kubernetes/enhancements/pull/1111 for more details.
+	KubernetesAPIApprovalPolicyConformant CustomResourceDefinitionConditionType = "KubernetesAPIApprovalPolicyConformant"
 )
 
 // CustomResourceDefinitionCondition contains details for the current condition of this pod.

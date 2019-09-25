@@ -26,16 +26,16 @@ import (
 	"strconv"
 	"strings"
 
-	"k8s.io/api/core/v1"
-	cloudprovider "k8s.io/cloud-provider"
-
-	"github.com/Azure/azure-sdk-for-go/services/compute/mgmt/2018-10-01/compute"
-	"github.com/Azure/azure-sdk-for-go/services/network/mgmt/2017-09-01/network"
+	"github.com/Azure/azure-sdk-for-go/services/compute/mgmt/2019-03-01/compute"
+	"github.com/Azure/azure-sdk-for-go/services/network/mgmt/2018-07-01/network"
 	"github.com/Azure/go-autorest/autorest/to"
+
+	"k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/types"
 	utilerrors "k8s.io/apimachinery/pkg/util/errors"
 	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/apimachinery/pkg/util/uuid"
+	cloudprovider "k8s.io/cloud-provider"
 	"k8s.io/klog"
 )
 
@@ -70,7 +70,7 @@ func (az *Cloud) getStandardMachineID(resourceGroup, machineName string) string 
 	return fmt.Sprintf(
 		machineIDTemplate,
 		az.SubscriptionID,
-		resourceGroup,
+		strings.ToLower(resourceGroup),
 		machineName)
 }
 
@@ -84,13 +84,13 @@ func (az *Cloud) getAvailabilitySetID(resourceGroup, availabilitySetName string)
 }
 
 // returns the full identifier of a loadbalancer frontendipconfiguration.
-func (az *Cloud) getFrontendIPConfigID(lbName, backendPoolName string) string {
+func (az *Cloud) getFrontendIPConfigID(lbName, fipConfigName string) string {
 	return fmt.Sprintf(
 		frontendIPConfigIDTemplate,
 		az.SubscriptionID,
 		az.ResourceGroup,
 		lbName,
-		backendPoolName)
+		fipConfigName)
 }
 
 // returns the full identifier of a loadbalancer backendpool.
@@ -294,10 +294,6 @@ outer:
 	return -1, fmt.Errorf("securityGroup priorities are exhausted")
 }
 
-func (az *Cloud) getIPForMachine(nodeName types.NodeName) (string, string, error) {
-	return az.vmSet.GetIPByNodeName(string(nodeName))
-}
-
 var polyTable = crc32.MakeTable(crc32.Koopman)
 
 //MakeCRC32 : convert string to CRC32 format
@@ -343,7 +339,14 @@ func (as *availabilitySet) GetInstanceIDByNodeName(name string) (string, error) 
 			return "", err
 		}
 	}
-	return *machine.ID, nil
+
+	resourceID := *machine.ID
+	convertedResourceID, err := convertResourceGroupNameToLower(resourceID)
+	if err != nil {
+		klog.Errorf("convertResourceGroupNameToLower failed with error: %v", err)
+		return "", err
+	}
+	return convertedResourceID, nil
 }
 
 // GetPowerStatusByNodeName returns the power state of the specified node.
@@ -460,9 +463,9 @@ func (as *availabilitySet) GetIPByNodeName(name string) (string, string, error) 
 // getAgentPoolAvailabiliySets lists the virtual machines for the resource group and then builds
 // a list of availability sets that match the nodes available to k8s.
 func (as *availabilitySet) getAgentPoolAvailabiliySets(nodes []*v1.Node) (agentPoolAvailabilitySets *[]string, err error) {
-	vms, err := as.VirtualMachineClientListWithRetry(as.ResourceGroup)
+	vms, err := as.ListVirtualMachines(as.ResourceGroup)
 	if err != nil {
-		klog.Errorf("as.getNodeAvailabilitySet - VirtualMachineClientListWithRetry failed, err=%v", err)
+		klog.Errorf("as.getNodeAvailabilitySet - ListVirtualMachines failed, err=%v", err)
 		return nil, err
 	}
 	vmNameToAvailabilitySetID := make(map[string]string, len(vms))
@@ -629,24 +632,24 @@ func (as *availabilitySet) getPrimaryInterfaceWithVMSet(nodeName, vmSetName stri
 	return nic, nil
 }
 
-// ensureHostInPool ensures the given VM's Primary NIC's Primary IP Configuration is
+// EnsureHostInPool ensures the given VM's Primary NIC's Primary IP Configuration is
 // participating in the specified LoadBalancer Backend Pool.
-func (as *availabilitySet) ensureHostInPool(service *v1.Service, nodeName types.NodeName, backendPoolID string, vmSetName string, isInternal bool) error {
+func (as *availabilitySet) EnsureHostInPool(service *v1.Service, nodeName types.NodeName, backendPoolID string, vmSetName string, isInternal bool) error {
 	vmName := mapNodeNameToVMName(nodeName)
 	serviceName := getServiceName(service)
 	nic, err := as.getPrimaryInterfaceWithVMSet(vmName, vmSetName)
 	if err != nil {
 		if err == errNotInVMSet {
-			klog.V(3).Infof("ensureHostInPool skips node %s because it is not in the vmSet %s", nodeName, vmSetName)
+			klog.V(3).Infof("EnsureHostInPool skips node %s because it is not in the vmSet %s", nodeName, vmSetName)
 			return nil
 		}
 
-		klog.Errorf("error: az.ensureHostInPool(%s), az.vmSet.GetPrimaryInterface.Get(%s, %s), err=%v", nodeName, vmName, vmSetName, err)
+		klog.Errorf("error: az.EnsureHostInPool(%s), az.vmSet.GetPrimaryInterface.Get(%s, %s), err=%v", nodeName, vmName, vmSetName, err)
 		return err
 	}
 
 	if nic.ProvisioningState != nil && *nic.ProvisioningState == nicFailedState {
-		klog.V(3).Infof("ensureHostInPool skips node %s because its primary nic %s is in Failed state", nodeName, *nic.Name)
+		klog.Warningf("EnsureHostInPool skips node %s because its primary nic %s is in Failed state", nodeName, *nic.Name)
 		return nil
 	}
 
@@ -673,16 +676,19 @@ func (as *availabilitySet) ensureHostInPool(service *v1.Service, nodeName types.
 			// sets, the same network interface couldn't be added to more than one load balancer of
 			// the same type. Omit those nodes (e.g. masters) so Azure ARM won't complain
 			// about this.
+			newBackendPoolsIDs := make([]string, 0, len(newBackendPools))
 			for _, pool := range newBackendPools {
-				backendPool := *pool.ID
-				matches := backendPoolIDRE.FindStringSubmatch(backendPool)
-				if len(matches) == 2 {
-					lbName := matches[1]
-					if strings.HasSuffix(lbName, InternalLoadBalancerNameSuffix) == isInternal {
-						klog.V(4).Infof("Node %q has already been added to LB %q, omit adding it to a new one", nodeName, lbName)
-						return nil
-					}
+				if pool.ID != nil {
+					newBackendPoolsIDs = append(newBackendPoolsIDs, *pool.ID)
 				}
+			}
+			isSameLB, oldLBName, err := isBackendPoolOnSameLB(backendPoolID, newBackendPoolsIDs)
+			if err != nil {
+				return err
+			}
+			if !isSameLB {
+				klog.V(4).Infof("Node %q has already been added to LB %q, omit adding it to a new one", nodeName, oldLBName)
+				return nil
 			}
 		}
 
@@ -695,18 +701,7 @@ func (as *availabilitySet) ensureHostInPool(service *v1.Service, nodeName types.
 
 		nicName := *nic.Name
 		klog.V(3).Infof("nicupdate(%s): nic(%s) - updating", serviceName, nicName)
-		ctx, cancel := getContextWithCancel()
-		defer cancel()
-		resp, err := as.InterfacesClient.CreateOrUpdate(ctx, as.ResourceGroup, *nic.Name, nic)
-		klog.V(10).Infof("InterfacesClient.CreateOrUpdate(%q): end", *nic.Name)
-		if as.CloudProviderBackoff && shouldRetryHTTPRequest(resp, err) {
-			klog.V(2).Infof("nicupdate(%s) backing off: nic(%s) - updating, err=%v", serviceName, nicName, err)
-			retryErr := as.CreateOrUpdateInterfaceWithRetry(service, nic)
-			if retryErr != nil {
-				err = retryErr
-				klog.V(2).Infof("nicupdate(%s) abort backoff: nic(%s) - updating", serviceName, nicName)
-			}
-		}
+		err := as.CreateOrUpdateInterface(service, nic)
 		if err != nil {
 			return err
 		}
@@ -731,7 +726,7 @@ func (as *availabilitySet) EnsureHostsInPool(service *v1.Service, nodes []*v1.No
 		}
 
 		f := func() error {
-			err := as.ensureHostInPool(service, types.NodeName(localNodeName), backendPoolID, vmSetName, isInternal)
+			err := as.EnsureHostInPool(service, types.NodeName(localNodeName), backendPoolID, vmSetName, isInternal)
 			if err != nil {
 				return fmt.Errorf("ensure(%s): backendPoolID(%s) - failed to ensure host in pool: %q", getServiceName(service), backendPoolID, err)
 			}
@@ -748,8 +743,8 @@ func (as *availabilitySet) EnsureHostsInPool(service *v1.Service, nodes []*v1.No
 	return nil
 }
 
-// EnsureBackendPoolDeleted ensures the loadBalancer backendAddressPools deleted from the specified vmSet.
-func (as *availabilitySet) EnsureBackendPoolDeleted(service *v1.Service, poolID, vmSetName string, backendAddressPools *[]network.BackendAddressPool) error {
+// EnsureBackendPoolDeleted ensures the loadBalancer backendAddressPools deleted from the specified nodes.
+func (as *availabilitySet) EnsureBackendPoolDeleted(service *v1.Service, backendPoolID, vmSetName string, backendAddressPools *[]network.BackendAddressPool) error {
 	// Do nothing for availability set.
 	return nil
 }

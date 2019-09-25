@@ -66,10 +66,10 @@ var _ = g.Describe("[Conformance][Area:Networking][Feature:Router]", func() {
 			}
 		}
 
-		host, err = waitForRouterInternalIP(oc)
+		host, err = exutil.WaitForRouterInternalIP(oc)
 		o.Expect(err).NotTo(o.HaveOccurred())
 
-		serviceIP, err = waitForRouterServiceIP(oc)
+		serviceIP, err = exutil.WaitForRouterServiceIP(oc)
 		o.Expect(err).NotTo(o.HaveOccurred())
 
 		bearerToken, err = findMetricsBearerToken(oc)
@@ -96,7 +96,7 @@ var _ = g.Describe("[Conformance][Area:Networking][Feature:Router]", func() {
 
 		g.It("[Flaky] should expose prometheus metrics for a route", func() {
 			g.By("when a route exists")
-			configPath := exutil.FixturePath("testdata", "router-metrics.yaml")
+			configPath := exutil.FixturePath("testdata", "router", "router-metrics.yaml")
 			err := oc.Run("create").Args("-f", configPath).Execute()
 			o.Expect(err).NotTo(o.HaveOccurred())
 

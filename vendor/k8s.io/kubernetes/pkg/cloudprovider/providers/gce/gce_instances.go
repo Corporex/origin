@@ -29,15 +29,14 @@ import (
 	compute "google.golang.org/api/compute/v1"
 	"k8s.io/klog"
 
+	"github.com/GoogleCloudPlatform/k8s-cloud-provider/pkg/cloud"
+	"github.com/GoogleCloudPlatform/k8s-cloud-provider/pkg/cloud/filter"
+	"github.com/GoogleCloudPlatform/k8s-cloud-provider/pkg/cloud/meta"
 	"k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/apimachinery/pkg/util/wait"
 	cloudprovider "k8s.io/cloud-provider"
-	"k8s.io/kubernetes/pkg/cloudprovider/providers/gce/cloud"
-	"k8s.io/kubernetes/pkg/cloudprovider/providers/gce/cloud/filter"
-	"k8s.io/kubernetes/pkg/cloudprovider/providers/gce/cloud/meta"
-	kubeletapis "k8s.io/kubernetes/pkg/kubelet/apis"
 )
 
 const (
@@ -60,7 +59,7 @@ func splitNodesByZone(nodes []*v1.Node) map[string][]*v1.Node {
 }
 
 func getZone(n *v1.Node) string {
-	zone, ok := n.Labels[kubeletapis.LabelZoneFailureDomain]
+	zone, ok := n.Labels[v1.LabelZoneFailureDomain]
 	if !ok {
 		return defaultZone
 	}
@@ -427,6 +426,19 @@ func (g *Cloud) AddAliasToInstance(nodeName types.NodeName, alias *net.IPNet) er
 // Gets the named instances, returning cloudprovider.InstanceNotFound if any
 // instance is not found
 func (g *Cloud) getInstancesByNames(names []string) ([]*gceInstance, error) {
+	foundInstances, err := g.getFoundInstanceByNames(names)
+	if err != nil {
+		return nil, err
+	}
+	if len(foundInstances) != len(names) {
+		return nil, cloudprovider.InstanceNotFound
+	}
+	return foundInstances, nil
+}
+
+// Gets the named instances, returning a list of gceInstances it was able to find from the provided
+// list of names.
+func (g *Cloud) getFoundInstanceByNames(names []string) ([]*gceInstance, error) {
 	ctx, cancel := cloud.ContextWithCallTimeout()
 	defer cancel()
 
@@ -473,20 +485,17 @@ func (g *Cloud) getInstancesByNames(names []string) ([]*gceInstance, error) {
 		}
 	}
 
-	if remaining > 0 {
-		var failed []string
-		for k := range found {
-			if found[k] == nil {
-				failed = append(failed, k)
-			}
-		}
-		klog.Errorf("Failed to retrieve instances: %v", failed)
-		return nil, cloudprovider.InstanceNotFound
-	}
-
 	var ret []*gceInstance
-	for _, instance := range found {
-		ret = append(ret, instance)
+	var failed []string
+	for name, instance := range found {
+		if instance != nil {
+			ret = append(ret, instance)
+		} else {
+			failed = append(failed, name)
+		}
+	}
+	if len(failed) > 0 {
+		klog.Errorf("Failed to retrieve instances: %v", failed)
 	}
 
 	return ret, nil

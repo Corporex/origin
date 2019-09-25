@@ -9,10 +9,14 @@ load(
 go_test(
     name = "go_default_test",
     srcs = [
+        "apiapproval_test.go",
+        "apply_test.go",
         "basic_test.go",
+        "change_test.go",
         "finalization_test.go",
         "objectmeta_test.go",
         "registration_test.go",
+        "scope_test.go",
         "subresources_test.go",
         "table_test.go",
         "validation_test.go",
@@ -41,6 +45,7 @@ go_test(
         "//staging/src/k8s.io/apimachinery/pkg/util/wait:go_default_library",
         "//staging/src/k8s.io/apimachinery/pkg/watch:go_default_library",
         "//staging/src/k8s.io/apiserver/pkg/endpoints/request:go_default_library",
+        "//staging/src/k8s.io/apiserver/pkg/features:go_default_library",
         "//staging/src/k8s.io/apiserver/pkg/util/feature:go_default_library",
         "//staging/src/k8s.io/apiserver/pkg/util/feature/testing:go_default_library",
         "//staging/src/k8s.io/client-go/dynamic:go_default_library",

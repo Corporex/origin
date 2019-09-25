@@ -31,7 +31,7 @@ import (
 
 	"k8s.io/api/core/v1"
 	policy "k8s.io/api/policy/v1beta1"
-	schedulerapi "k8s.io/api/scheduling/v1beta1"
+	schedulerapi "k8s.io/api/scheduling/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/fields"
@@ -68,7 +68,6 @@ const (
 	makeSchedulableDelay   = 20 * time.Second
 	freshStatusLimit       = 20 * time.Second
 
-	gkeEndpoint        = "https://test-container.sandbox.googleapis.com"
 	gkeUpdateTimeout   = 15 * time.Minute
 	gkeNodepoolNameKey = "cloud.google.com/gke-nodepool"
 
@@ -574,7 +573,8 @@ var _ = SIGDescribe("Cluster size autoscaling [Slow]", func() {
 			framework.AddOrUpdateLabelOnNode(c, node, labelKey, labelValue)
 		}
 
-		scheduling.CreateNodeSelectorPods(f, "node-selector", minSize+1, map[string]string{labelKey: labelValue}, false)
+		err = scheduling.CreateNodeSelectorPods(f, "node-selector", minSize+1, map[string]string{labelKey: labelValue}, false)
+		framework.ExpectNoError(err)
 
 		By("Waiting for new node to appear and annotating it")
 		framework.WaitForGroupSize(minMig, int32(minSize+1))
@@ -1035,13 +1035,24 @@ func runDrainTest(f *framework.Framework, migSizes map[string]int, namespace str
 	verifyFunction(increasedSize)
 }
 
+func getGkeApiEndpoint() string {
+	gkeApiEndpoint := os.Getenv("CLOUDSDK_API_ENDPOINT_OVERRIDES_CONTAINER")
+	if gkeApiEndpoint == "" {
+		gkeApiEndpoint = "https://test-container.sandbox.googleapis.com"
+	}
+	if strings.HasSuffix(gkeApiEndpoint, "/") {
+		gkeApiEndpoint = gkeApiEndpoint[:len(gkeApiEndpoint)-1]
+	}
+	return gkeApiEndpoint
+}
+
 func getGKEURL(apiVersion string, suffix string) string {
 	out, err := execCmd("gcloud", "auth", "print-access-token").Output()
 	framework.ExpectNoError(err)
 	token := strings.Replace(string(out), "\n", "", -1)
 
 	return fmt.Sprintf("%s/%s/%s?access_token=%s",
-		gkeEndpoint,
+		getGkeApiEndpoint(),
 		apiVersion,
 		suffix,
 		token)
@@ -1185,6 +1196,11 @@ func executeHTTPRequest(method string, url string, body string) (string, error) 
 		return "", err
 	}
 	resp, err := client.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+
 	respBody, err := ioutil.ReadAll(resp.Body)
 	if err != nil {
 		return "", err
@@ -1960,7 +1976,7 @@ func createPriorityClasses(f *framework.Framework) func() {
 		highPriorityClassName:       1000,
 	}
 	for className, priority := range priorityClasses {
-		_, err := f.ClientSet.SchedulingV1beta1().PriorityClasses().Create(&schedulerapi.PriorityClass{ObjectMeta: metav1.ObjectMeta{Name: className}, Value: priority})
+		_, err := f.ClientSet.SchedulingV1().PriorityClasses().Create(&schedulerapi.PriorityClass{ObjectMeta: metav1.ObjectMeta{Name: className}, Value: priority})
 		if err != nil {
 			klog.Errorf("Error creating priority class: %v", err)
 		}
@@ -1969,7 +1985,7 @@ func createPriorityClasses(f *framework.Framework) func() {
 
 	return func() {
 		for className := range priorityClasses {
-			err := f.ClientSet.SchedulingV1beta1().PriorityClasses().Delete(className, nil)
+			err := f.ClientSet.SchedulingV1().PriorityClasses().Delete(className, nil)
 			if err != nil {
 				klog.Errorf("Error deleting priority class: %v", err)
 			}

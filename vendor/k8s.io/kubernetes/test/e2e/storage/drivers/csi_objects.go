@@ -20,13 +20,15 @@ limitations under the License.
 package drivers
 
 import (
+	"flag"
 	"fmt"
 	"io/ioutil"
 	"os"
 	"path"
 	"path/filepath"
 
-	v1 "k8s.io/api/core/v1"
+	"k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/uuid"
 
@@ -34,18 +36,22 @@ import (
 	"k8s.io/kubernetes/test/e2e/framework"
 )
 
-var csiImageVersions = map[string]string{
-	"hostpathplugin":   "v0.4.0",
-	"csi-attacher":     "v0.4.0",
-	"csi-provisioner":  "v0.4.0",
-	"driver-registrar": "v0.4.0",
-}
+var (
+	csiImageVersion  = flag.String("storage.csi.image.version", "", "overrides the default tag used for hostpathplugin/csi-attacher/csi-provisioner/driver-registrar images")
+	csiImageRegistry = flag.String("storage.csi.image.registry", "quay.io/k8scsi", "overrides the default repository used for hostpathplugin/csi-attacher/csi-provisioner/driver-registrar images")
+	csiImageVersions = map[string]string{
+		"hostpathplugin":   "v0.4.0",
+		"csi-attacher":     "v0.4.0",
+		"csi-provisioner":  "v0.4.0",
+		"driver-registrar": "v0.4.0",
+	}
+)
 
 func csiContainerImage(image string) string {
 	var fullName string
-	fullName += framework.TestContext.CSIImageRegistry + "/" + image + ":"
-	if framework.TestContext.CSIImageVersion != "" {
-		fullName += framework.TestContext.CSIImageVersion
+	fullName += *csiImageRegistry + "/" + image + ":"
+	if *csiImageVersion != "" {
+		fullName += *csiImageVersion
 	} else {
 		fullName += csiImageVersions[image]
 	}
@@ -74,7 +80,7 @@ func shredFile(filePath string) {
 
 // createGCESecrets downloads the GCP IAM Key for the default compute service account
 // and puts it in a secret for the GCE PD CSI Driver to consume
-func createGCESecrets(client clientset.Interface, config framework.VolumeTestConfig) {
+func createGCESecrets(client clientset.Interface, ns string) {
 	saEnv := "E2E_GOOGLE_APPLICATION_CREDENTIALS"
 	saFile := fmt.Sprintf("/tmp/%s/cloud-sa.json", string(uuid.NewUUID()))
 
@@ -101,7 +107,7 @@ func createGCESecrets(client clientset.Interface, config framework.VolumeTestCon
 	s := &v1.Secret{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      "cloud-sa",
-			Namespace: config.Namespace,
+			Namespace: ns,
 		},
 		Type: v1.SecretTypeOpaque,
 		Data: map[string][]byte{
@@ -109,6 +115,8 @@ func createGCESecrets(client clientset.Interface, config framework.VolumeTestCon
 		},
 	}
 
-	_, err = client.CoreV1().Secrets(config.Namespace).Create(s)
-	framework.ExpectNoError(err, "Failed to create Secret %v", s.GetName())
+	_, err = client.CoreV1().Secrets(ns).Create(s)
+	if !apierrors.IsAlreadyExists(err) {
+		framework.ExpectNoError(err, "Failed to create Secret %v", s.GetName())
+	}
 }

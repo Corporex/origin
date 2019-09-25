@@ -25,25 +25,16 @@ import (
 	"sync/atomic"
 	"time"
 
-	"k8s.io/klog"
-
 	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/apimachinery/pkg/util/wait"
+	"k8s.io/apiserver/pkg/server/httplog"
+	"k8s.io/klog"
 )
 
 // HealthzChecker is a named healthz checker.
 type HealthzChecker interface {
 	Name() string
 	Check(req *http.Request) error
-}
-
-var defaultHealthz = sync.Once{}
-
-// DefaultHealthz installs the default healthz check to the http.DefaultServeMux.
-func DefaultHealthz(checks ...HealthzChecker) {
-	defaultHealthz.Do(func() {
-		InstallHandler(http.DefaultServeMux, checks...)
-	})
 }
 
 // PingHealthz returns true automatically when checked
@@ -167,7 +158,7 @@ func handleRootHealthz(checks ...HealthzChecker) http.HandlerFunc {
 			if err := check.Check(r); err != nil {
 				// don't include the error since this endpoint is public.  If someone wants more detail
 				// they should have explicit permission to the detailed checks.
-				klog.V(6).Infof("healthz check %v failed: %v", check.Name(), err)
+				klog.V(4).Infof("healthz check %v failed: %v", check.Name(), err)
 				fmt.Fprintf(&verboseOut, "[-]%v failed: reason withheld\n", check.Name())
 				failed = true
 			} else {
@@ -182,10 +173,12 @@ func handleRootHealthz(checks ...HealthzChecker) http.HandlerFunc {
 		// always be verbose on failure
 		if failed {
 			klog.V(2).Infof("%vhealthz check failed", verboseOut.String())
-			http.Error(w, fmt.Sprintf("%vhealthz check failed", verboseOut.String()), http.StatusInternalServerError)
+			http.Error(httplog.Unlogged(r, w), fmt.Sprintf("%vhealthz check failed", verboseOut.String()), http.StatusInternalServerError)
 			return
 		}
 
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		w.Header().Set("X-Content-Type-Options", "nosniff")
 		if _, found := r.URL.Query()["verbose"]; !found {
 			fmt.Fprint(w, "ok")
 			return

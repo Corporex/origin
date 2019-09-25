@@ -19,8 +19,10 @@ package server
 import (
 	"crypto/tls"
 	"fmt"
+	"io/ioutil"
 	"net"
 	"net/http"
+	"os"
 	goruntime "runtime"
 	"sort"
 	"strconv"
@@ -28,11 +30,11 @@ import (
 	"sync/atomic"
 	"time"
 
-	swagger "github.com/emicklei/go-restful-swagger12"
 	jsonpatch "github.com/evanphx/json-patch"
 	"github.com/go-openapi/spec"
 	"github.com/pborman/uuid"
 
+	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/serializer"
 	"k8s.io/apimachinery/pkg/util/sets"
@@ -60,9 +62,11 @@ import (
 	"k8s.io/apiserver/pkg/server/routes"
 	serverstore "k8s.io/apiserver/pkg/server/storage"
 	utilfeature "k8s.io/apiserver/pkg/util/feature"
-	"k8s.io/apiserver/pkg/util/logs"
 	"k8s.io/client-go/informers"
+	"k8s.io/client-go/kubernetes"
+	v1 "k8s.io/client-go/kubernetes/typed/core/v1"
 	restclient "k8s.io/client-go/rest"
+	"k8s.io/component-base/logs"
 	"k8s.io/klog"
 	openapicommon "k8s.io/kube-openapi/pkg/common"
 
@@ -102,7 +106,6 @@ type Config struct {
 	AdmissionControl      admission.Interface
 	CorsAllowedOriginList []string
 
-	EnableSwaggerUI bool
 	EnableIndex     bool
 	EnableProfiling bool
 	EnableDiscovery bool
@@ -146,8 +149,6 @@ type Config struct {
 	Serializer runtime.NegotiatedSerializer
 	// OpenAPIConfig will be used in generating OpenAPI spec. This is nil by default. Use DefaultOpenAPIConfig for "working" defaults.
 	OpenAPIConfig *openapicommon.Config
-	// SwaggerConfig will be used in generating Swagger spec. This is nil by default. Use DefaultSwaggerConfig for "working" defaults.
-	SwaggerConfig *swagger.Config
 
 	// RESTOptionsGetter is used to construct RESTStorage types via the generic registry.
 	RESTOptionsGetter genericregistry.RESTOptionsGetter
@@ -158,6 +159,9 @@ type Config struct {
 	// If specified, long running requests such as watch will be allocated a random timeout between this value, and
 	// twice this value.  Note that it is up to the request handlers to ignore or honor this timeout. In seconds.
 	MinRequestTimeout int
+	// MinimalShutdownDuration allows to block shutdown for some time, e.g. until endpoints pointing to this API server
+	// have converged on all node. During this time, the API server keeps serving.
+	MinimalShutdownDuration time.Duration
 	// The limit on the total size increase all "copy" operations in a json
 	// patch may cause.
 	// This affects all places that applies json patch in the binary.
@@ -165,9 +169,6 @@ type Config struct {
 	// The limit on the request body size that would be accepted and decoded in a write request.
 	// 0 means no limit.
 	MaxRequestBodyBytes int64
-	// MinimalShutdownDuration allows to block shutdown for some time, e.g. until endpoints pointing to this API server
-	// have converged on all node. During this time, the API server keeps serving.
-	MinimalShutdownDuration time.Duration
 	// MaxRequestsInFlight is the maximum number of parallel non-long-running requests. Every further
 	// request has to wait. Applies only to non-mutating requests.
 	MaxRequestsInFlight int
@@ -186,6 +187,9 @@ type Config struct {
 	// If not specify any in flags, then genericapiserver will only enable defaultAPIResourceConfig.
 	MergedResourceConfig *serverstore.ResourceConfig
 
+	// EventSink receives events about the life cycle of the API server, e.g. readiness, serving, signals and termination.
+	EventSink EventSink
+
 	//===========================================================================
 	// values below here are targets for removal
 	//===========================================================================
@@ -194,6 +198,11 @@ type Config struct {
 	// kube-proxy, services, etc.) can reach the GenericAPIServer.
 	// If nil or 0.0.0.0, the host's default interface will be used.
 	PublicAddress net.IP
+}
+
+// EventSink allows to create events.
+type EventSink interface {
+	Create(event *corev1.Event) (*corev1.Event, error)
 }
 
 type RecommendedConfig struct {
@@ -234,9 +243,6 @@ type SecureServingInfo struct {
 	// HTTP2MaxStreamsPerConnection is the limit that the api server imposes on each client.
 	// A value of zero means to use the default provided by golang's HTTP/2 support.
 	HTTP2MaxStreamsPerConnection int
-
-	// HTTP1Only indicates that http2 should not be enabled.
-	HTTP1Only bool
 }
 
 type AuthenticationInfo struct {
@@ -313,7 +319,7 @@ func NewRecommendedConfig(codecs serializer.CodecFactory) *RecommendedConfig {
 func DefaultOpenAPIConfig(getDefinitions openapicommon.GetOpenAPIDefinitions, defNamer *apiopenapi.DefinitionNamer) *openapicommon.Config {
 	return &openapicommon.Config{
 		ProtocolList:   []string{"https"},
-		IgnorePrefixes: []string{"/swaggerapi"},
+		IgnorePrefixes: []string{},
 		Info: &spec.Info{
 			InfoProps: spec.InfoProps{
 				Title: "Generic API Server",
@@ -327,23 +333,6 @@ func DefaultOpenAPIConfig(getDefinitions openapicommon.GetOpenAPIDefinitions, de
 		GetOperationIDAndTags: apiopenapi.GetOperationIDAndTags,
 		GetDefinitionName:     defNamer.GetDefinitionName,
 		GetDefinitions:        getDefinitions,
-	}
-}
-
-// DefaultSwaggerConfig returns a default configuration without WebServiceURL and
-// WebServices set.
-func DefaultSwaggerConfig() *swagger.Config {
-	return &swagger.Config{
-		ApiPath:         "/swaggerapi",
-		SwaggerPath:     "/swaggerui/",
-		SwaggerFilePath: "/swagger-ui/",
-		SchemaFormatHandler: func(typeName string) string {
-			switch typeName {
-			case "metav1.Time", "*metav1.Time":
-				return "date-time"
-			}
-			return ""
-		},
 	}
 }
 
@@ -428,15 +417,12 @@ func (c *Config) Complete(informers informers.SharedInformerFactory) CompletedCo
 			}
 		}
 	}
-	if c.SwaggerConfig != nil && len(c.SwaggerConfig.WebServicesUrl) == 0 {
-		if c.SecureServing != nil {
-			c.SwaggerConfig.WebServicesUrl = "https://" + c.ExternalAddress
-		} else {
-			c.SwaggerConfig.WebServicesUrl = "http://" + c.ExternalAddress
-		}
-	}
 	if c.DiscoveryAddresses == nil {
 		c.DiscoveryAddresses = discovery.DefaultAddresses{DefaultAddress: c.ExternalAddress}
+	}
+
+	if c.EventSink == nil {
+		c.EventSink = nullEventSink{}
 	}
 
 	AuthorizeClientBearerToken(c.LoopbackClientConfig, &c.Authentication, &c.Authorization)
@@ -451,7 +437,56 @@ func (c *Config) Complete(informers informers.SharedInformerFactory) CompletedCo
 // Complete fills in any fields not set that are required to have valid data and can be derived
 // from other fields. If you're going to `ApplyOptions`, do that first. It's mutating the receiver.
 func (c *RecommendedConfig) Complete() CompletedConfig {
+	if c.ClientConfig != nil {
+		ref, err := eventReference()
+		if err != nil {
+			klog.Warningf("Failed to derive event reference, won't create events: %v", err)
+			c.EventSink = nullEventSink{}
+		} else {
+			ns := ref.Namespace
+			if len(ns) == 0 {
+				ns = "default"
+			}
+			c.EventSink = &v1.EventSinkImpl{
+				Interface: kubernetes.NewForConfigOrDie(c.ClientConfig).CoreV1().Events(ns),
+			}
+		}
+	}
+
 	return c.Config.Complete(c.SharedInformerFactory)
+}
+
+func eventReference() (*corev1.ObjectReference, error) {
+	ns := os.Getenv("POD_NAMESPACE")
+	pod := os.Getenv("POD_NAME")
+	if len(ns) == 0 && len(pod) > 0 {
+		serviceAccountNamespaceFile := "/var/run/secrets/kubernetes.io/serviceaccount/namespace"
+		if _, err := os.Stat(serviceAccountNamespaceFile); err == nil {
+			bs, err := ioutil.ReadFile(serviceAccountNamespaceFile)
+			if err != nil {
+				return nil, err
+			}
+			ns = string(bs)
+		}
+	}
+	if len(ns) == 0 {
+		pod = ""
+		ns = "kube-system"
+	}
+	if len(pod) == 0 {
+		return &corev1.ObjectReference{
+			Kind:       "Namespace",
+			Name:       ns,
+			APIVersion: "v1",
+		}, nil
+	}
+
+	return &corev1.ObjectReference{
+		Kind:       "Pod",
+		Namespace:  ns,
+		Name:       pod,
+		APIVersion: "v1",
+	}, nil
 }
 
 // New creates a new server which logically combines the handling chain with the passed server.
@@ -492,7 +527,6 @@ func (c completedConfig) New(name string, delegationTarget DelegationTarget) (*G
 
 		listedPathProvider: apiServerHandler,
 
-		swaggerConfig: c.SwaggerConfig,
 		openAPIConfig: c.OpenAPIConfig,
 
 		postStartHooks:         map[string]postStartHookEntry{},
@@ -505,7 +539,16 @@ func (c completedConfig) New(name string, delegationTarget DelegationTarget) (*G
 
 		enableAPIResponseCompression: c.EnableAPIResponseCompression,
 		maxRequestBodyBytes:          c.MaxRequestBodyBytes,
+
+		eventSink: c.EventSink,
 	}
+
+	ref, err := eventReference()
+	if err != nil {
+		klog.Warningf("Failed to derive event reference, won't create events: %v", err)
+		c.EventSink = nullEventSink{}
+	}
+	s.eventRef = ref
 
 	for {
 		if c.JSONPatchMaxCopyBytes <= 0 {
@@ -592,6 +635,7 @@ func DefaultBuildHandlerChain(apiHandler http.Handler, c *Config) http.Handler {
 	handler = genericfilters.WithTimeoutForNonLongRunningRequests(handler, c.LongRunningFunc, c.RequestTimeout)
 	handler = genericfilters.WithWaitGroup(handler, c.LongRunningFunc, c.HandlerChainWaitGroup)
 	handler = genericapifilters.WithRequestInfo(handler, c.RequestInfoResolver)
+	handler = genericapifilters.WithCacheControl(handler)
 	handler = genericfilters.WithPanicRecovery(handler)
 	return handler
 }
@@ -599,9 +643,6 @@ func DefaultBuildHandlerChain(apiHandler http.Handler, c *Config) http.Handler {
 func installAPI(s *GenericAPIServer, c *Config) {
 	if c.EnableIndex {
 		routes.Index{}.Install(s.listedPathProvider, s.Handler.NonGoRestfulMux)
-	}
-	if c.SwaggerConfig != nil && c.EnableSwaggerUI {
-		routes.SwaggerUI{}.Install(s.Handler.NonGoRestfulMux)
 	}
 	if c.EnableProfiling {
 		routes.Profiling{}.Install(s.Handler.NonGoRestfulMux)
@@ -677,4 +718,10 @@ func AuthorizeClientBearerToken(loopback *restclient.Config, authn *Authenticati
 
 	tokenAuthorizer := authorizerfactory.NewPrivilegedGroups(user.SystemPrivilegedGroup)
 	authz.Authorizer = authorizerunion.New(tokenAuthorizer, authz.Authorizer)
+}
+
+type nullEventSink struct{}
+
+func (nullEventSink) Create(event *corev1.Event) (*corev1.Event, error) {
+	return nil, nil
 }

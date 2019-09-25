@@ -12,20 +12,27 @@ import (
 
 	g "github.com/onsi/ginkgo"
 	o "github.com/onsi/gomega"
+
 	dto "github.com/prometheus/client_model/go"
 	"github.com/prometheus/common/expfmt"
 
 	v1 "k8s.io/api/core/v1"
+
 	kapierrs "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/wait"
+
 	clientset "k8s.io/client-go/kubernetes"
 	watchtools "k8s.io/client-go/tools/watch"
+
 	kapi "k8s.io/kubernetes/pkg/apis/core"
 	"k8s.io/kubernetes/pkg/client/conditions"
 	e2e "k8s.io/kubernetes/test/e2e/framework"
 
+	"github.com/openshift/origin/test/extended/networking"
 	exutil "github.com/openshift/origin/test/extended/util"
+
+	operatorv1 "github.com/openshift/api/operator/v1"
 )
 
 const waitForPrometheusStartSeconds = 240
@@ -146,14 +153,13 @@ var _ = g.Describe("[Feature:Prometheus][Conformance] Prometheus", func() {
 					targets.Expect(labels{"job": "alertmanager-main"}, "up", "^https://.*/metrics$"),
 					targets.Expect(labels{"job": "crio"}, "up", "^http://.*/metrics$"),
 					targets.Expect(labels{"job": "telemeter-client"}, "up", "^https://.*/metrics$"),
-					targets.Expect(labels{"job": "sdn"}, "up", "^http://.*/metrics$"),
 				)
 				if len(lastErrs) > 0 {
 					e2e.Logf("missing some targets: %v", lastErrs)
 					return false, nil
 				}
 				return true, nil
-			})).NotTo(o.HaveOccurred())
+			})).NotTo(o.HaveOccurred(), "possibly some services didn't register ServiceMonitors to allow metrics collection")
 		})
 		g.It("should have a Watchdog alert in firing state", func() {
 			oc.SetupProject()
@@ -183,17 +189,19 @@ var _ = g.Describe("[Feature:Prometheus][Conformance] Prometheus", func() {
 			}
 			runQueries(tests, oc, ns, execPodName, url, bearerToken)
 		})
-		g.It("should be able to get the sdn ovs flows", func() {
-			oc.SetupProject()
-			ns := oc.Namespace()
-			execPodName := e2e.CreateExecPodOrFail(oc.AdminKubeClient(), ns, "execpod", func(pod *v1.Pod) { pod.Spec.Containers[0].Image = "centos:7" })
-			defer func() { oc.AdminKubeClient().CoreV1().Pods(ns).Delete(execPodName, metav1.NewDeleteOptions(1)) }()
+		networking.InOpenShiftSDNContext(func() {
+			g.It("should be able to get the sdn ovs flows", func() {
+				oc.SetupProject()
+				ns := oc.Namespace()
+				execPodName := e2e.CreateExecPodOrFail(oc.AdminKubeClient(), ns, "execpod", func(pod *v1.Pod) { pod.Spec.Containers[0].Image = "centos:7" })
+				defer func() { oc.AdminKubeClient().CoreV1().Pods(ns).Delete(execPodName, metav1.NewDeleteOptions(1)) }()
 
-			tests := map[string][]metricTest{
-				//something
-				`openshift_sdn_ovs_flows`: {metricTest{greaterThanEqual: true, value: 1}},
-			}
-			runQueries(tests, oc, ns, execPodName, url, bearerToken)
+				tests := map[string][]metricTest{
+					//something
+					`openshift_sdn_ovs_flows`: {metricTest{greaterThanEqual: true, value: 1}},
+				}
+				runQueries(tests, oc, ns, execPodName, url, bearerToken)
+			})
 		})
 		g.It("should report less than two alerts in firing or pending state", func() {
 			oc.SetupProject()
@@ -207,9 +215,78 @@ var _ = g.Describe("[Feature:Prometheus][Conformance] Prometheus", func() {
 			tests := map[string][]metricTest{
 				// should be checking there is no more than 1 alerts firing.
 				// Checking for specific alert is done in "should have a Watchdog alert in firing state".
-				`sum(ALERTS{alertstate=~"firing|pending"})`: {metricTest{greaterThanEqual: false, value: 2}},
+				`sum(ALERTS{alertstate="firing"})`: {metricTest{greaterThanEqual: false, value: 2}},
 			}
 			runQueries(tests, oc, ns, execPodName, url, bearerToken)
+		})
+		g.It("should provide ingress metrics", func() {
+			oc.SetupProject()
+			ns := oc.Namespace()
+
+			execPodName := e2e.CreateExecPodOrFail(oc.AdminKubeClient(), ns, "execpod", func(pod *v1.Pod) { pod.Spec.Containers[0].Image = "centos:7" })
+			defer func() { oc.AdminKubeClient().CoreV1().Pods(ns).Delete(execPodName, metav1.NewDeleteOptions(1)) }()
+
+			g.By("creating a non-default ingresscontroller")
+			replicas := int32(1)
+			ingress := &operatorv1.IngressController{
+				ObjectMeta: metav1.ObjectMeta{
+					Namespace: "openshift-ingress-operator",
+					Name:      "prometheus",
+				},
+				Spec: operatorv1.IngressControllerSpec{
+					Domain:   "prometheus.e2e.openshift.example.com",
+					Replicas: &replicas,
+					EndpointPublishingStrategy: &operatorv1.EndpointPublishingStrategy{
+						Type: operatorv1.PrivateStrategyType,
+					},
+					RouteSelector: &metav1.LabelSelector{
+						MatchLabels: map[string]string{
+							"e2e-test": ns,
+						},
+					},
+				},
+			}
+			_, err := oc.AdminOperatorClient().OperatorV1().IngressControllers(ingress.Namespace).Create(ingress)
+			o.Expect(err).NotTo(o.HaveOccurred())
+
+			defer func() {
+				if err := oc.AdminOperatorClient().OperatorV1().IngressControllers(ingress.Namespace).Delete(ingress.Name, metav1.NewDeleteOptions(1)); err != nil {
+					e2e.Logf("WARNING: failed to delete ingresscontroller '%s/%s' created during test cleanup: %v", ingress.Namespace, ingress.Name, err)
+				} else {
+					e2e.Logf("deleted test ingresscontroller '%s/%s'", ingress.Namespace, ingress.Name)
+				}
+			}()
+
+			var lastErrs []error
+			o.Expect(wait.PollImmediate(10*time.Second, 4*time.Minute, func() (bool, error) {
+				contents, err := getBearerTokenURLViaPod(ns, execPodName, fmt.Sprintf("%s/api/v1/targets", url), bearerToken)
+				o.Expect(err).NotTo(o.HaveOccurred())
+
+				targets := &prometheusTargets{}
+				err = json.Unmarshal([]byte(contents), targets)
+				o.Expect(err).NotTo(o.HaveOccurred())
+
+				g.By("verifying all expected jobs have a working target")
+				lastErrs = all(
+					// Is there a good way to discover the name and thereby avoid leaking the naming algorithm?
+					targets.Expect(labels{"job": "router-internal-default"}, "up", "^https://.*/metrics$"),
+					targets.Expect(labels{"job": "router-internal-prometheus"}, "up", "^https://.*/metrics$"),
+				)
+				if len(lastErrs) > 0 {
+					e2e.Logf("missing some targets: %v", lastErrs)
+					return false, nil
+				}
+				return true, nil
+			})).NotTo(o.HaveOccurred(), "ingress router cannot report metrics to monitoring system")
+
+			g.By("verifying standard metrics keys")
+			queries := map[string][]metricTest{
+				`template_router_reload_seconds_count{job="router-internal-default"}`:    {metricTest{greaterThanEqual: true, value: 1}},
+				`haproxy_server_up{job="router-internal-default"}`:                       {metricTest{greaterThanEqual: true, value: 1}},
+				`template_router_reload_seconds_count{job="router-internal-prometheus"}`: {metricTest{greaterThanEqual: true, value: 1}},
+				`haproxy_server_up{job="router-internal-prometheus"}`:                    {metricTest{greaterThanEqual: true, value: 1}},
+			}
+			runQueries(queries, oc, ns, execPodName, url, bearerToken)
 		})
 	})
 })

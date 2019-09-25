@@ -10,7 +10,6 @@ import (
 	"github.com/openshift/api/template"
 	exutil "github.com/openshift/origin/test/extended/util"
 	"github.com/openshift/origin/test/extended/util/db"
-	testutil "github.com/openshift/origin/test/util"
 
 	//	kapiv1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -119,7 +118,7 @@ func PostgreSQLReplicationTestFactory(oc *exutil.CLI, image string, cleanup func
 		// up prior to the AfterEach processing, to guaranteed deletion order
 		defer cleanup()
 
-		err := testutil.WaitForPolicyUpdate(oc.KubeClient().AuthorizationV1(), oc.Namespace(), "create", template.Resource("templates"), true)
+		err := WaitForPolicyUpdate(oc.KubeClient().AuthorizationV1(), oc.Namespace(), "create", template.Resource("templates"), true)
 		o.Expect(err).NotTo(o.HaveOccurred())
 
 		exutil.WaitForOpenShiftNamespaceImageStreams(oc)

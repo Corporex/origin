@@ -10,11 +10,11 @@ import (
 
 	"k8s.io/client-go/rest"
 
-	"github.com/openshift/origin/pkg/oauth/util"
+	"github.com/openshift/library-go/pkg/oauth/oauthdiscovery"
 	exutil "github.com/openshift/origin/test/extended/util"
 )
 
-var _ = g.Describe("The OAuth server", func() {
+var _ = g.Describe("[Feature:OAuthServer] OAuth server", func() {
 	defer g.GinkgoRecover()
 
 	oc := exutil.NewCLI("oauth", exutil.KubeConfigPath())
@@ -23,7 +23,7 @@ var _ = g.Describe("The OAuth server", func() {
 		metadataJSON, err := oc.Run("get").Args("--raw", "/.well-known/oauth-authorization-server").Output()
 		o.Expect(err).NotTo(o.HaveOccurred())
 
-		metadata := &util.OauthAuthorizationServerMetadata{}
+		metadata := &oauthdiscovery.OauthAuthorizationServerMetadata{}
 		err = json.Unmarshal([]byte(metadataJSON), metadata)
 		o.Expect(err).NotTo(o.HaveOccurred())
 

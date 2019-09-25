@@ -26,10 +26,10 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/klog"
 	"k8s.io/kubernetes/pkg/util/mount"
-	"k8s.io/kubernetes/pkg/util/strings"
 	"k8s.io/kubernetes/pkg/volume"
 	"k8s.io/kubernetes/pkg/volume/util"
 	"k8s.io/kubernetes/pkg/volume/util/recyclerclient"
+	utilstrings "k8s.io/utils/strings"
 )
 
 // This is the primary entrypoint for volume plugins.
@@ -84,6 +84,10 @@ func (plugin *nfsPlugin) CanSupport(spec *volume.Spec) bool {
 		(spec.Volume != nil && spec.Volume.NFS != nil)
 }
 
+func (plugin *nfsPlugin) IsMigratedToCSI() bool {
+	return false
+}
+
 func (plugin *nfsPlugin) RequiresRemount() bool {
 	return false
 }
@@ -116,10 +120,11 @@ func (plugin *nfsPlugin) newMounterInternal(spec *volume.Spec, pod *v1.Pod, moun
 
 	return &nfsMounter{
 		nfs: &nfs{
-			volName: spec.Name(),
-			mounter: mounter,
-			pod:     pod,
-			plugin:  plugin,
+			volName:         spec.Name(),
+			mounter:         mounter,
+			pod:             pod,
+			plugin:          plugin,
+			MetricsProvider: volume.NewMetricsStatFS(getPath(pod.UID, spec.Name(), plugin.host)),
 		},
 		server:       source.Server,
 		exportPath:   source.Path,
@@ -134,10 +139,11 @@ func (plugin *nfsPlugin) NewUnmounter(volName string, podUID types.UID) (volume.
 
 func (plugin *nfsPlugin) newUnmounterInternal(volName string, podUID types.UID, mounter mount.Interface) (volume.Unmounter, error) {
 	return &nfsUnmounter{&nfs{
-		volName: volName,
-		mounter: mounter,
-		pod:     &v1.Pod{ObjectMeta: metav1.ObjectMeta{UID: podUID}},
-		plugin:  plugin,
+		volName:         volName,
+		mounter:         mounter,
+		pod:             &v1.Pod{ObjectMeta: metav1.ObjectMeta{UID: podUID}},
+		plugin:          plugin,
+		MetricsProvider: volume.NewMetricsStatFS(getPath(podUID, volName, plugin.host)),
 	}}, nil
 }
 
@@ -180,12 +186,12 @@ type nfs struct {
 	pod     *v1.Pod
 	mounter mount.Interface
 	plugin  *nfsPlugin
-	volume.MetricsNil
+	volume.MetricsProvider
 }
 
 func (nfsVolume *nfs) GetPath() string {
 	name := nfsPluginName
-	return nfsVolume.plugin.host.GetPodVolumeDir(nfsVolume.pod.UID, strings.EscapeQualifiedNameForDisk(name), nfsVolume.volName)
+	return nfsVolume.plugin.host.GetPodVolumeDir(nfsVolume.pod.UID, utilstrings.EscapeQualifiedName(name), nfsVolume.volName)
 }
 
 // Checks prior to mount operations to verify that the required components (binaries, etc.)
@@ -294,7 +300,7 @@ func (c *nfsUnmounter) TearDownAt(dir string) error {
 	// Use extensiveMountPointCheck to consult /proc/mounts. We can't use faster
 	// IsLikelyNotMountPoint (lstat()), since there may be root_squash on the
 	// NFS server and kubelet may not be able to do lstat/stat() there.
-	return util.UnmountMountPoint(dir, c.mounter, true /* extensiveMountPointCheck */)
+	return mount.CleanupMountPoint(dir, c.mounter, true /* extensiveMountPointCheck */)
 }
 
 func getVolumeSource(spec *volume.Spec) (*v1.NFSVolumeSource, bool, error) {
@@ -306,4 +312,8 @@ func getVolumeSource(spec *volume.Spec) (*v1.NFSVolumeSource, bool, error) {
 	}
 
 	return nil, false, fmt.Errorf("Spec does not reference a NFS volume type")
+}
+
+func getPath(uid types.UID, volName string, host volume.VolumeHost) string {
+	return host.GetPodVolumeDir(uid, utilstrings.EscapeQualifiedName(nfsPluginName), volName)
 }

@@ -11,7 +11,6 @@ go_test(
     srcs = [
         "eviction_manager_test.go",
         "helpers_test.go",
-        "main_test.go",
         "memory_threshold_notifier_test.go",
         "mock_threshold_notifier_test.go",
     ],
@@ -57,7 +56,6 @@ go_library(
         "//pkg/kubelet/eviction/api:go_default_library",
         "//pkg/kubelet/lifecycle:go_default_library",
         "//pkg/kubelet/metrics:go_default_library",
-        "//pkg/kubelet/pod:go_default_library",
         "//pkg/kubelet/server/stats:go_default_library",
         "//pkg/kubelet/types:go_default_library",
         "//pkg/kubelet/util/format:go_default_library",

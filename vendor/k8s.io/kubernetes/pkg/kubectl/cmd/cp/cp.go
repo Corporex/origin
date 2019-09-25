@@ -37,7 +37,7 @@ import (
 
 	"bytes"
 
-	"github.com/renstrom/dedent"
+	"github.com/lithammer/dedent"
 	"github.com/spf13/cobra"
 )
 
@@ -66,6 +66,7 @@ var (
 		/file/path for a local file`)
 )
 
+// CopyOptions have the data required to perform the copy operation
 type CopyOptions struct {
 	Container  string
 	Namespace  string
@@ -77,6 +78,7 @@ type CopyOptions struct {
 	genericclioptions.IOStreams
 }
 
+// NewCopyOptions creates the options for copy
 func NewCopyOptions(ioStreams genericclioptions.IOStreams) *CopyOptions {
 	return &CopyOptions{
 		IOStreams: ioStreams,
@@ -140,6 +142,7 @@ func extractFileSpec(arg string) (fileSpec, error) {
 	return fileSpec{}, errFileSpecDoesntMatchFormat
 }
 
+// Complete completes all the required options
 func (o *CopyOptions) Complete(f cmdutil.Factory, cmd *cobra.Command) error {
 	var err error
 	o.Namespace, _, err = f.ToRawKubeConfigLoader().Namespace()
@@ -159,6 +162,7 @@ func (o *CopyOptions) Complete(f cmdutil.Factory, cmd *cobra.Command) error {
 	return nil
 }
 
+// Validate makes sure provided values for CopyOptions are valid
 func (o *CopyOptions) Validate(cmd *cobra.Command, args []string) error {
 	if len(args) != 2 {
 		return cmdutil.UsageErrorf(cmd, cpUsageStr)
@@ -166,6 +170,7 @@ func (o *CopyOptions) Validate(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
+// Run performs the execution
 func (o *CopyOptions) Run(args []string) error {
 	if len(args) < 2 {
 		return fmt.Errorf("source and destination are required")
@@ -295,8 +300,7 @@ func (o *CopyOptions) copyFromPod(src, dest fileSpec) error {
 
 	go func() {
 		defer outStream.Close()
-		err := o.execute(options)
-		cmdutil.CheckErr(err)
+		o.execute(options)
 	}()
 	prefix := getPrefix(src.File)
 	prefix = path.Clean(prefix)
@@ -316,8 +320,8 @@ func stripPathShortcuts(p string) string {
 		trimmed = strings.TrimPrefix(newPath, "../")
 	}
 
-	// trim leftover ".."
-	if newPath == ".." {
+	// trim leftover {".", ".."}
+	if newPath == "." || newPath == ".." {
 		newPath = ""
 	}
 
@@ -339,65 +343,71 @@ func makeTar(srcPath, destPath string, writer io.Writer) error {
 }
 
 func recursiveTar(srcBase, srcFile, destBase, destFile string, tw *tar.Writer) error {
-	filepath := path.Join(srcBase, srcFile)
-	stat, err := os.Lstat(filepath)
+	srcPath := path.Join(srcBase, srcFile)
+	matchedPaths, err := filepath.Glob(srcPath)
 	if err != nil {
 		return err
 	}
-	if stat.IsDir() {
-		files, err := ioutil.ReadDir(filepath)
+	for _, fpath := range matchedPaths {
+		stat, err := os.Lstat(fpath)
 		if err != nil {
 			return err
 		}
-		if len(files) == 0 {
-			//case empty directory
-			hdr, _ := tar.FileInfoHeader(stat, filepath)
+		if stat.IsDir() {
+			files, err := ioutil.ReadDir(fpath)
+			if err != nil {
+				return err
+			}
+			if len(files) == 0 {
+				//case empty directory
+				hdr, _ := tar.FileInfoHeader(stat, fpath)
+				hdr.Name = destFile
+				if err := tw.WriteHeader(hdr); err != nil {
+					return err
+				}
+			}
+			for _, f := range files {
+				if err := recursiveTar(srcBase, path.Join(srcFile, f.Name()), destBase, path.Join(destFile, f.Name()), tw); err != nil {
+					return err
+				}
+			}
+			return nil
+		} else if stat.Mode()&os.ModeSymlink != 0 {
+			//case soft link
+			hdr, _ := tar.FileInfoHeader(stat, fpath)
+			target, err := os.Readlink(fpath)
+			if err != nil {
+				return err
+			}
+
+			hdr.Linkname = target
 			hdr.Name = destFile
 			if err := tw.WriteHeader(hdr); err != nil {
 				return err
 			}
-		}
-		for _, f := range files {
-			if err := recursiveTar(srcBase, path.Join(srcFile, f.Name()), destBase, path.Join(destFile, f.Name()), tw); err != nil {
+		} else {
+			//case regular file or other file type like pipe
+			hdr, err := tar.FileInfoHeader(stat, fpath)
+			if err != nil {
 				return err
 			}
-		}
-		return nil
-	} else if stat.Mode()&os.ModeSymlink != 0 {
-		//case soft link
-		hdr, _ := tar.FileInfoHeader(stat, filepath)
-		target, err := os.Readlink(filepath)
-		if err != nil {
-			return err
-		}
+			hdr.Name = destFile
 
-		hdr.Linkname = target
-		hdr.Name = destFile
-		if err := tw.WriteHeader(hdr); err != nil {
-			return err
-		}
-	} else {
-		//case regular file or other file type like pipe
-		hdr, err := tar.FileInfoHeader(stat, filepath)
-		if err != nil {
-			return err
-		}
-		hdr.Name = destFile
+			if err := tw.WriteHeader(hdr); err != nil {
+				return err
+			}
 
-		if err := tw.WriteHeader(hdr); err != nil {
-			return err
-		}
+			f, err := os.Open(fpath)
+			if err != nil {
+				return err
+			}
+			defer f.Close()
 
-		f, err := os.Open(filepath)
-		if err != nil {
-			return err
+			if _, err := io.Copy(tw, f); err != nil {
+				return err
+			}
+			return f.Close()
 		}
-		defer f.Close()
-
-		if _, err := io.Copy(tw, f); err != nil {
-			return err
-		}
-		return f.Close()
 	}
 	return nil
 }
@@ -431,9 +441,14 @@ func (o *CopyOptions) untarAll(reader io.Reader, destDir, prefix string) error {
 
 		// basic file information
 		mode := header.FileInfo().Mode()
-		destFileName := path.Join(destDir, header.Name[len(prefix):])
-		baseName := path.Dir(destFileName)
+		destFileName := filepath.Join(destDir, header.Name[len(prefix):])
 
+		if !isDestRelative(destDir, destFileName) {
+			fmt.Fprintf(o.IOStreams.ErrOut, "warning: file %q is outside target destination, skipping\n", destFileName)
+			continue
+		}
+
+		baseName := filepath.Dir(destFileName)
 		if err := os.MkdirAll(baseName, 0755); err != nil {
 			return err
 		}
@@ -447,15 +462,14 @@ func (o *CopyOptions) untarAll(reader io.Reader, destDir, prefix string) error {
 		// We need to ensure that the destination file is always within boundries
 		// of the destination directory. This prevents any kind of path traversal
 		// from within tar archive.
-		dir, file := filepath.Split(destFileName)
-		evaledPath, err := filepath.EvalSymlinks(dir)
+		evaledPath, err := filepath.EvalSymlinks(baseName)
 		if err != nil {
 			return err
 		}
 		// For scrutiny we verify both the actual destination as well as we follow
 		// all the links that might lead outside of the destination directory.
-		if !isDestRelative(destDir, destFileName) || !isDestRelative(destDir, filepath.Join(evaledPath, file)) {
-			fmt.Fprintf(o.IOStreams.ErrOut, "warning: link %q is pointing to %q which is outside target destination, skipping\n", destFileName, header.Linkname)
+		if !isDestRelative(destDir, filepath.Join(evaledPath, filepath.Base(destFileName))) {
+			fmt.Fprintf(o.IOStreams.ErrOut, "warning: file %q is outside target destination, skipping\n", destFileName)
 			continue
 		}
 
@@ -464,7 +478,11 @@ func (o *CopyOptions) untarAll(reader io.Reader, destDir, prefix string) error {
 			// We need to ensure that the link destination is always within boundries
 			// of the destination directory. This prevents any kind of path traversal
 			// from within tar archive.
-			if !isDestRelative(destDir, linkJoin(destFileName, linkname)) {
+			linkTarget := linkname
+			if !filepath.IsAbs(linkname) {
+				linkTarget = filepath.Join(evaledPath, linkname)
+			}
+			if !isDestRelative(destDir, linkTarget) {
 				fmt.Fprintf(o.IOStreams.ErrOut, "warning: link %q is pointing to %q which is outside target destination, skipping\n", destFileName, header.Linkname)
 				continue
 			}
@@ -489,23 +507,10 @@ func (o *CopyOptions) untarAll(reader io.Reader, destDir, prefix string) error {
 	return nil
 }
 
-// linkJoin joins base and link to get the final path to be created.
-// It will consider whether link is an absolute path or not when returning result.
-func linkJoin(base, link string) string {
-	if filepath.IsAbs(link) {
-		return link
-	}
-	return filepath.Join(base, link)
-}
-
 // isDestRelative returns true if dest is pointing outside the base directory,
 // false otherwise.
 func isDestRelative(base, dest string) bool {
-	fullPath := dest
-	if !filepath.IsAbs(dest) {
-		fullPath = filepath.Join(base, dest)
-	}
-	relative, err := filepath.Rel(base, fullPath)
+	relative, err := filepath.Rel(base, dest)
 	if err != nil {
 		return false
 	}
@@ -527,7 +532,7 @@ func (o *CopyOptions) execute(options *exec.ExecOptions) error {
 	}
 
 	options.Config = o.ClientConfig
-	options.PodClient = o.Clientset.Core()
+	options.PodClient = o.Clientset.CoreV1()
 
 	if err := options.Validate(); err != nil {
 		return err

@@ -28,8 +28,17 @@ import (
 	"github.com/go-openapi/spec"
 	"github.com/go-openapi/strfmt"
 	"github.com/go-openapi/validate"
-	"k8s.io/klog"
-
+	"k8s.io/apiextensions-apiserver/pkg/apis/apiextensions"
+	"k8s.io/apiextensions-apiserver/pkg/apiserver/conversion"
+	apiservervalidation "k8s.io/apiextensions-apiserver/pkg/apiserver/validation"
+	informers "k8s.io/apiextensions-apiserver/pkg/client/informers/internalversion/apiextensions/internalversion"
+	listers "k8s.io/apiextensions-apiserver/pkg/client/listers/apiextensions/internalversion"
+	"k8s.io/apiextensions-apiserver/pkg/controller/establish"
+	"k8s.io/apiextensions-apiserver/pkg/controller/finalizer"
+	"k8s.io/apiextensions-apiserver/pkg/crdserverscheme"
+	apiextensionsfeatures "k8s.io/apiextensions-apiserver/pkg/features"
+	"k8s.io/apiextensions-apiserver/pkg/registry/customresource"
+	"k8s.io/apiextensions-apiserver/pkg/registry/customresource/tableconvertor"
 	apiequality "k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
@@ -43,31 +52,26 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/serializer/versioning"
 	"k8s.io/apimachinery/pkg/types"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
+	"k8s.io/apimachinery/pkg/util/sets"
+	utilwaitgroup "k8s.io/apimachinery/pkg/util/waitgroup"
 	"k8s.io/apiserver/pkg/admission"
+	"k8s.io/apiserver/pkg/authorization/authorizer"
 	"k8s.io/apiserver/pkg/endpoints/handlers"
+	"k8s.io/apiserver/pkg/endpoints/handlers/fieldmanager"
 	"k8s.io/apiserver/pkg/endpoints/handlers/responsewriters"
 	"k8s.io/apiserver/pkg/endpoints/metrics"
 	apirequest "k8s.io/apiserver/pkg/endpoints/request"
+	"k8s.io/apiserver/pkg/features"
 	"k8s.io/apiserver/pkg/registry/generic"
 	genericregistry "k8s.io/apiserver/pkg/registry/generic/registry"
+	genericfilters "k8s.io/apiserver/pkg/server/filters"
 	"k8s.io/apiserver/pkg/storage/storagebackend"
 	utilfeature "k8s.io/apiserver/pkg/util/feature"
+	"k8s.io/apiserver/pkg/util/webhook"
 	"k8s.io/client-go/scale"
 	"k8s.io/client-go/scale/scheme/autoscalingv1"
 	"k8s.io/client-go/tools/cache"
-
-	"k8s.io/apiextensions-apiserver/pkg/apis/apiextensions"
-	"k8s.io/apiextensions-apiserver/pkg/apiserver/conversion"
-	apiservervalidation "k8s.io/apiextensions-apiserver/pkg/apiserver/validation"
-	informers "k8s.io/apiextensions-apiserver/pkg/client/informers/internalversion/apiextensions/internalversion"
-	listers "k8s.io/apiextensions-apiserver/pkg/client/listers/apiextensions/internalversion"
-	"k8s.io/apiextensions-apiserver/pkg/controller/establish"
-	"k8s.io/apiextensions-apiserver/pkg/controller/finalizer"
-	"k8s.io/apiextensions-apiserver/pkg/crdserverscheme"
-	apiextensionsfeatures "k8s.io/apiextensions-apiserver/pkg/features"
-	"k8s.io/apiextensions-apiserver/pkg/registry/customresource"
-	"k8s.io/apiextensions-apiserver/pkg/registry/customresource/tableconvertor"
-	"k8s.io/apiserver/pkg/util/webhook"
+	"k8s.io/klog"
 )
 
 // crdHandler serves the `/apis` endpoint.
@@ -96,6 +100,12 @@ type crdHandler struct {
 	masterCount int
 
 	converterFactory *conversion.CRConverterFactory
+
+	// so that we can do create on update.
+	authorizer authorizer.Authorizer
+
+	// request timeout we should delay storage teardown for
+	requestTimeout time.Duration
 }
 
 // crdInfo stores enough information to serve the storage for the custom resource
@@ -119,6 +129,8 @@ type crdInfo struct {
 
 	// storageVersion is the CRD version used when storing the object in etcd.
 	storageVersion string
+
+	waitGroup *utilwaitgroup.SafeWaitGroup
 }
 
 // crdStorageMap goes from customresourcedefinition to its storage
@@ -134,7 +146,9 @@ func NewCustomResourceDefinitionHandler(
 	establishingController *establish.EstablishingController,
 	serviceResolver webhook.ServiceResolver,
 	authResolverWrapper webhook.AuthenticationInfoResolverWrapper,
-	masterCount int) (*crdHandler, error) {
+	masterCount int,
+	authorizer authorizer.Authorizer,
+	requestTimeout time.Duration) (*crdHandler, error) {
 	ret := &crdHandler{
 		versionDiscoveryHandler: versionDiscoveryHandler,
 		groupDiscoveryHandler:   groupDiscoveryHandler,
@@ -145,6 +159,8 @@ func NewCustomResourceDefinitionHandler(
 		admission:               admission,
 		establishingController:  establishingController,
 		masterCount:             masterCount,
+		authorizer:              authorizer,
+		requestTimeout:          requestTimeout,
 	}
 	crdInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
 		UpdateFunc: ret.updateCustomResourceDefinition,
@@ -162,6 +178,15 @@ func NewCustomResourceDefinitionHandler(
 
 	return ret, nil
 }
+
+// possiblyAcrossAllNamespacesVerbs contains those verbs which can be per-namespace and across all
+// namespaces for namespaces resources. I.e. for these an empty namespace in the requestInfo is fine.
+var possiblyAcrossAllNamespacesVerbs = sets.NewString("list", "watch")
+
+// watches are expected to handle storage disruption gracefully,
+// both on the server-side (by terminating the watch connection)
+// and on the client side (by restarting the watch)
+var longRunningFilter = genericfilters.BasicLongRunningRequestCheck(sets.NewString("watch"), sets.NewString())
 
 func (r *crdHandler) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	ctx := req.Context()
@@ -198,10 +223,24 @@ func (r *crdHandler) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
+
+	// if the scope in the CRD and the scope in request differ (with exception of the verbs in possiblyAcrossAllNamespacesVerbs
+	// for namespaced resources), pass request to the delegate, which is supposed to lead to a 404.
+	namespacedCRD, namespacedReq := crd.Spec.Scope == apiextensions.NamespaceScoped, len(requestInfo.Namespace) > 0
+	if !namespacedCRD && namespacedReq {
+		r.delegate.ServeHTTP(w, req)
+		return
+	}
+	if namespacedCRD && !namespacedReq && !possiblyAcrossAllNamespacesVerbs.Has(requestInfo.Verb) {
+		r.delegate.ServeHTTP(w, req)
+		return
+	}
+
 	if !apiextensions.HasServedCRDVersion(crd, requestInfo.APIVersion) {
 		r.delegate.ServeHTTP(w, req)
 		return
 	}
+
 	// There is a small chance that a CRD is being served because NamesAccepted condition is true,
 	// but it becomes "unserved" because another names update leads to a conflict
 	// and EstablishingController wasn't fast enough to put the CRD into the Established condition.
@@ -228,9 +267,12 @@ func (r *crdHandler) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		string(types.JSONPatchType),
 		string(types.MergePatchType),
 	}
+	if utilfeature.DefaultFeatureGate.Enabled(features.ServerSideApply) {
+		supportedTypes = append(supportedTypes, string(types.ApplyPatchType))
+	}
 
-	var handler http.HandlerFunc
-	subresources, err := getSubresourcesForVersion(crd, requestInfo.APIVersion)
+	var handlerFunc http.HandlerFunc
+	subresources, err := apiextensions.GetSubresourcesForVersion(crd, requestInfo.APIVersion)
 	if err != nil {
 		utilruntime.HandleError(err)
 		http.Error(w, "the server could not properly serve the CR subresources", http.StatusInternalServerError)
@@ -238,18 +280,19 @@ func (r *crdHandler) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	}
 	switch {
 	case subresource == "status" && subresources != nil && subresources.Status != nil:
-		handler = r.serveStatus(w, req, requestInfo, crdInfo, terminating, supportedTypes)
+		handlerFunc = r.serveStatus(w, req, requestInfo, crdInfo, terminating, supportedTypes)
 	case subresource == "scale" && subresources != nil && subresources.Scale != nil:
-		handler = r.serveScale(w, req, requestInfo, crdInfo, terminating, supportedTypes)
+		handlerFunc = r.serveScale(w, req, requestInfo, crdInfo, terminating, supportedTypes)
 	case len(subresource) == 0:
-		handler = r.serveResource(w, req, requestInfo, crdInfo, terminating, supportedTypes)
+		handlerFunc = r.serveResource(w, req, requestInfo, crdInfo, terminating, supportedTypes)
 	default:
 		http.Error(w, "the server could not find the requested resource", http.StatusNotFound)
 	}
 
-	if handler != nil {
-		handler = metrics.InstrumentHandlerFunc(verb, resource, subresource, scope, handler)
-		handler(w, req)
+	if handlerFunc != nil {
+		handlerFunc = metrics.InstrumentHandlerFunc(verb, requestInfo.APIGroup, requestInfo.APIVersion, resource, subresource, scope, metrics.APIServerComponent, handlerFunc)
+		handler := genericfilters.WithWaitGroup(handlerFunc, longRunningFilter, crdInfo.waitGroup)
+		handler.ServeHTTP(w, req)
 		return
 	}
 }
@@ -356,18 +399,18 @@ func (r *crdHandler) updateCustomResourceDefinition(oldObj, newObj interface{}) 
 
 	klog.V(4).Infof("Updating customresourcedefinition %s", oldCRD.Name)
 
-	// Copy because we cannot write to storageMap without a race
-	// as it is used without locking elsewhere.
-	storageMap2 := storageMap.clone()
-	if oldInfo, ok := storageMap2[types.UID(oldCRD.UID)]; ok {
-		for _, storage := range oldInfo.storages {
-			// destroy only the main storage. Those for the subresources share cacher and etcd clients.
-			storage.CustomResource.DestroyFunc()
-		}
-		delete(storageMap2, types.UID(oldCRD.UID))
-	}
+	if oldInfo, ok := storageMap[types.UID(oldCRD.UID)]; ok {
+		// Copy because we cannot write to storageMap without a race
+		// as it is used without locking elsewhere.
+		storageMap2 := storageMap.clone()
 
-	r.customStorage.Store(storageMap2)
+		// Remove from the CRD info map and store the map
+		delete(storageMap2, types.UID(oldCRD.UID))
+		r.customStorage.Store(storageMap2)
+
+		// Tear down the old storage
+		go r.tearDown(oldInfo)
+	}
 }
 
 // removeDeadStorage removes REST storage that isn't being used
@@ -381,6 +424,7 @@ func (r *crdHandler) removeDeadStorage() {
 	r.customStorageLock.Lock()
 	defer r.customStorageLock.Unlock()
 
+	oldInfos := []*crdInfo{}
 	storageMap := r.customStorage.Load().(crdStorageMap)
 	// Copy because we cannot write to storageMap without a race
 	// as it is used without locking elsewhere
@@ -395,14 +439,38 @@ func (r *crdHandler) removeDeadStorage() {
 		}
 		if !found {
 			klog.V(4).Infof("Removing dead CRD storage for %s/%s", s.spec.Group, s.spec.Names.Kind)
-			for _, storage := range s.storages {
-				// destroy only the main storage. Those for the subresources share cacher and etcd clients.
-				storage.CustomResource.DestroyFunc()
-			}
+			oldInfos = append(oldInfos, s)
 			delete(storageMap2, uid)
 		}
 	}
 	r.customStorage.Store(storageMap2)
+
+	for _, s := range oldInfos {
+		go r.tearDown(s)
+	}
+}
+
+// Wait up to a minute for requests to drain, then tear down storage
+func (r *crdHandler) tearDown(oldInfo *crdInfo) {
+	requestsDrained := make(chan struct{})
+	go func() {
+		defer close(requestsDrained)
+		// Allow time for in-flight requests with a handle to the old info to register themselves
+		time.Sleep(time.Second)
+		// Wait for in-flight requests to drain
+		oldInfo.waitGroup.Wait()
+	}()
+
+	select {
+	case <-time.After(r.requestTimeout * 2):
+		klog.Warningf("timeout waiting for requests to drain for %s/%s, tearing down storage", oldInfo.spec.Group, oldInfo.spec.Names.Kind)
+	case <-requestsDrained:
+	}
+
+	for _, storage := range oldInfo.storages {
+		// destroy only the main storage. Those for the subresources share cacher and etcd clients.
+		storage.CustomResource.DestroyFunc()
+	}
 }
 
 // GetCustomResourceListerCollectionDeleter returns the ListerCollectionDeleter of
@@ -414,8 +482,6 @@ func (r *crdHandler) GetCustomResourceListerCollectionDeleter(crd *apiextensions
 	}
 	return info.storages[info.storageVersion].CustomResource, nil
 }
-
-var swaggerMetadataDescriptions = metav1.ObjectMeta{}.SwaggerDoc()
 
 func (r *crdHandler) getOrCreateServingInfoFor(crd *apiextensions.CustomResourceDefinition) (*crdInfo, error) {
 	storageMap := r.customStorage.Load().(crdStorageMap)
@@ -462,7 +528,7 @@ func (r *crdHandler) getOrCreateServingInfoFor(crd *apiextensions.CustomResource
 		typer := newUnstructuredObjectTyper(parameterScheme)
 		creator := unstructuredCreator{}
 
-		validationSchema, err := getSchemaForVersion(crd, v.Name)
+		validationSchema, err := apiextensions.GetSchemaForVersion(crd, v.Name)
 		if err != nil {
 			utilruntime.HandleError(err)
 			return nil, fmt.Errorf("the server could not properly serve the CR schema")
@@ -474,7 +540,7 @@ func (r *crdHandler) getOrCreateServingInfoFor(crd *apiextensions.CustomResource
 
 		var statusSpec *apiextensions.CustomResourceSubresourceStatus
 		var statusValidator *validate.SchemaValidator
-		subresources, err := getSubresourcesForVersion(crd, v.Name)
+		subresources, err := apiextensions.GetSubresourcesForVersion(crd, v.Name)
 		if err != nil {
 			utilruntime.HandleError(err)
 			return nil, fmt.Errorf("the server could not properly serve the CR subresources")
@@ -498,7 +564,7 @@ func (r *crdHandler) getOrCreateServingInfoFor(crd *apiextensions.CustomResource
 			scaleSpec = subresources.Scale
 		}
 
-		columns, err := getColumnsForVersion(crd, v.Name)
+		columns, err := apiextensions.GetColumnsForVersion(crd, v.Name)
 		if err != nil {
 			utilruntime.HandleError(err)
 			return nil, fmt.Errorf("the server could not properly serve the CR columns")
@@ -565,6 +631,18 @@ func (r *crdHandler) getOrCreateServingInfoFor(crd *apiextensions.CustomResource
 			MetaGroupVersion: metav1.SchemeGroupVersion,
 
 			TableConvertor: storages[v.Name].CustomResource,
+
+			Authorizer: r.authorizer,
+		}
+		if utilfeature.DefaultFeatureGate.Enabled(features.ServerSideApply) {
+			reqScope := requestScopes[v.Name]
+			reqScope.FieldManager = fieldmanager.NewCRDFieldManager(
+				reqScope.Convertor,
+				reqScope.Defaulter,
+				reqScope.Kind.GroupVersion(),
+				reqScope.HubGroupVersion,
+			)
+			requestScopes[v.Name] = reqScope
 		}
 
 		// override scaleSpec subresource values
@@ -603,6 +681,7 @@ func (r *crdHandler) getOrCreateServingInfoFor(crd *apiextensions.CustomResource
 		scaleRequestScopes:  scaleScopes,
 		statusRequestScopes: statusScopes,
 		storageVersion:      storageVersion,
+		waitGroup:           &utilwaitgroup.SafeWaitGroup{},
 	}
 
 	// Copy because we cannot write to storageMap without a race

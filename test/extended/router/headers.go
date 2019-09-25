@@ -20,7 +20,7 @@ import (
 var _ = g.Describe("[Conformance][Area:Networking][Feature:Router]", func() {
 	defer g.GinkgoRecover()
 	var (
-		configPath = exutil.FixturePath("testdata", "router-http-echo-server.yaml")
+		configPath = exutil.FixturePath("testdata", "router", "router-http-echo-server.yaml")
 		oc         = exutil.NewCLI("router-headers", exutil.KubeConfigPath())
 
 		routerIP  string
@@ -29,9 +29,9 @@ var _ = g.Describe("[Conformance][Area:Networking][Feature:Router]", func() {
 
 	g.BeforeEach(func() {
 		var err error
-		routerIP, err = waitForRouterServiceIP(oc)
+		routerIP, err = exutil.WaitForRouterServiceIP(oc)
 		o.Expect(err).NotTo(o.HaveOccurred())
-		metricsIP, err = waitForRouterInternalIP(oc)
+		metricsIP, err = exutil.WaitForRouterInternalIP(oc)
 		o.Expect(err).NotTo(o.HaveOccurred())
 
 		if routerIP != metricsIP {

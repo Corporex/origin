@@ -26,6 +26,11 @@ import (
 type ConversionStrategyType string
 
 const (
+	// KubeAPIApprovedAnnotation is an annotation that must be set to create a CRD for the k8s.io, *.k8s.io, kubernetes.io, or *.kubernetes.io namespaces.
+	// The value should be a link to a URL where the current spec was approved, so updates to the spec should also update the URL.
+	// If the API is unapproved, you may set the annotation to a string starting with `"unapproved"`.  For instance, `"unapproved, temporarily squatting"` or `"unapproved, experimental-only"`.  This is discouraged.
+	KubeAPIApprovedAnnotation = "api-approved.kubernetes.io"
+
 	// NoneConverter is a converter that only sets apiversion of the CR and leave everything else unchanged.
 	NoneConverter ConversionStrategyType = "None"
 	// WebhookConverter is a converter that calls to an external webhook to convert the CR.
@@ -91,6 +96,16 @@ type CustomResourceConversion struct {
 	// alpha-level and is only honored by servers that enable the CustomResourceWebhookConversion feature.
 	// +optional
 	WebhookClientConfig *WebhookClientConfig `json:"webhookClientConfig,omitempty" protobuf:"bytes,2,name=webhookClientConfig"`
+
+	// ConversionReviewVersions is an ordered list of preferred `ConversionReview`
+	// versions the Webhook expects. API server will try to use first version in
+	// the list which it supports. If none of the versions specified in this list
+	// supported by API server, conversion will fail for this object.
+	// If a persisted Webhook configuration specifies allowed versions and does not
+	// include any versions known to the API Server, calls to the webhook will fail.
+	// Default to `['v1beta1']`.
+	// +optional
+	ConversionReviewVersions []string `json:"conversionReviewVersions,omitempty" protobuf:"bytes,3,rep,name=conversionReviewVersions"`
 }
 
 // WebhookClientConfig contains the information to make a TLS
@@ -267,6 +282,11 @@ const (
 	NamesAccepted CustomResourceDefinitionConditionType = "NamesAccepted"
 	// Terminating means that the CustomResourceDefinition has been deleted and is cleaning up.
 	Terminating CustomResourceDefinitionConditionType = "Terminating"
+	// KubernetesAPIApprovalPolicyConformant indicates that an API in *.k8s.io or *.kubernetes.io is or is not approved.  For CRDs
+	// outside those groups, this condition will not be set.  For CRDs inside those groups, the condition will
+	// be true if .metadata.annotations["api-approved.kubernetes.io"] is set to a URL, otherwise it will be false.
+	// See https://github.com/kubernetes/enhancements/pull/1111 for more details.
+	KubernetesAPIApprovalPolicyConformant CustomResourceDefinitionConditionType = "KubernetesAPIApprovalPolicyConformant"
 )
 
 // CustomResourceDefinitionCondition contains details for the current condition of this pod.

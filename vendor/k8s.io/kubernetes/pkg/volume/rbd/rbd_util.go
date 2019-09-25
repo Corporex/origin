@@ -23,6 +23,7 @@ package rbd
 
 import (
 	"encoding/json"
+	"path/filepath"
 	"fmt"
 	"io/ioutil"
 	"os"
@@ -36,12 +37,12 @@ import (
 	"k8s.io/apimachinery/pkg/api/resource"
 	"k8s.io/apimachinery/pkg/util/errors"
 	"k8s.io/apimachinery/pkg/util/wait"
+	volumehelpers "k8s.io/cloud-provider/volume/helpers"
 	"k8s.io/klog"
-	fileutil "k8s.io/kubernetes/pkg/util/file"
 	"k8s.io/kubernetes/pkg/util/mount"
 	"k8s.io/kubernetes/pkg/util/node"
 	"k8s.io/kubernetes/pkg/volume"
-	volutil "k8s.io/kubernetes/pkg/volume/util"
+	utilpath "k8s.io/utils/path"
 )
 
 const (
@@ -55,6 +56,12 @@ const (
 	rbdImageWatcherSteps     = 10
 	rbdImageSizeUnitMiB      = 1024 * 1024
 )
+
+// A struct contains rbd image info.
+type rbdImageInfo struct {
+	pool string
+	name string
+}
 
 func getDevFromImageAndPool(pool, image string) (string, bool) {
 	device, found := getRbdDevFromImageAndPool(pool, image)
@@ -363,7 +370,7 @@ func (util *RBDUtil) AttachDisk(b rbdMounter) (string, error) {
 	var output []byte
 
 	globalPDPath := util.MakeGlobalPDName(*b.rbd)
-	if pathExists, pathErr := volutil.PathExists(globalPDPath); pathErr != nil {
+	if pathExists, pathErr := mount.PathExists(globalPDPath); pathErr != nil {
 		return "", fmt.Errorf("Error checking if path exists: %v", pathErr)
 	} else if !pathExists {
 		if err := os.MkdirAll(globalPDPath, 0750); err != nil {
@@ -486,7 +493,7 @@ func (util *RBDUtil) DetachDisk(plugin *rbdPlugin, deviceMountPath string, devic
 	// Currently, we don't persist rbd info on the disk, but for backward
 	// compatbility, we need to clean it if found.
 	rbdFile := path.Join(deviceMountPath, "rbd.json")
-	exists, err := fileutil.FileExists(rbdFile)
+	exists, err := utilpath.Exists(utilpath.CheckFollowSymlink, rbdFile)
 	if err != nil {
 		return err
 	}
@@ -505,7 +512,7 @@ func (util *RBDUtil) DetachDisk(plugin *rbdPlugin, deviceMountPath string, devic
 // DetachBlockDisk detaches the disk from the node.
 func (util *RBDUtil) DetachBlockDisk(disk rbdDiskUnmapper, mapPath string) error {
 
-	if pathExists, pathErr := volutil.PathExists(mapPath); pathErr != nil {
+	if pathExists, pathErr := mount.PathExists(mapPath); pathErr != nil {
 		return fmt.Errorf("Error checking if path exists: %v", pathErr)
 	} else if !pathExists {
 		klog.Warningf("Warning: Unmap skipped because path does not exist: %v", mapPath)
@@ -580,9 +587,8 @@ func (util *RBDUtil) cleanOldRBDFile(plugin *rbdPlugin, rbdFile string) error {
 func (util *RBDUtil) CreateImage(p *rbdVolumeProvisioner) (r *v1.RBDPersistentVolumeSource, size int, err error) {
 	var output []byte
 	capacity := p.options.PVC.Spec.Resources.Requests[v1.ResourceName(v1.ResourceStorage)]
-	volSizeBytes := capacity.Value()
 	// Convert to MB that rbd defaults on.
-	sz, err := volutil.RoundUpSizeInt(volSizeBytes, 1024*1024)
+	sz, err := volumehelpers.RoundUpToMiBInt(capacity)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -641,9 +647,9 @@ func (util *RBDUtil) DeleteImage(p *rbdVolumeDeleter) error {
 func (util *RBDUtil) ExpandImage(rbdExpander *rbdVolumeExpander, oldSize resource.Quantity, newSize resource.Quantity) (resource.Quantity, error) {
 	var output []byte
 	var err error
-	volSizeBytes := newSize.Value()
+
 	// Convert to MB that rbd defaults on.
-	sz := int(volutil.RoundUpSize(volSizeBytes, 1024*1024))
+	sz := int(volumehelpers.RoundUpToMiB(newSize))
 	newVolSz := fmt.Sprintf("%d", sz)
 	newSizeQuant := resource.MustParse(fmt.Sprintf("%dMi", sz))
 
@@ -788,4 +794,16 @@ func (util *RBDUtil) rbdStatus(b *rbdMounter) (bool, string, error) {
 		klog.Warningf("rbd: no watchers on %s", b.Image)
 		return false, output, nil
 	}
+}
+
+// getRbdImageInfo try to get rbdImageInfo from deviceMountPath.
+func getRbdImageInfo(deviceMountPath string) (*rbdImageInfo, error) {
+	deviceMountedPathSeps := strings.Split(filepath.Base(deviceMountPath), "-image-")
+	if len(deviceMountedPathSeps) != 2 {
+		return nil, fmt.Errorf("Can't found devicePath for %s ", deviceMountPath)
+	}
+	return &rbdImageInfo{
+		pool: deviceMountedPathSeps[0],
+		name: deviceMountedPathSeps[1],
+	}, nil
 }

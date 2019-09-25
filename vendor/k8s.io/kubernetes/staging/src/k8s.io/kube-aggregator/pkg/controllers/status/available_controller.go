@@ -47,10 +47,12 @@ import (
 
 type certFunc func() []byte
 
+// ServiceResolver knows how to convert a service reference into an actual location.
 type ServiceResolver interface {
 	ResolveEndpoint(namespace, name string) (*url.URL, error)
 }
 
+// AvailableConditionController handles checking the availability of registered API services.
 type AvailableConditionController struct {
 	apiServiceClient apiregistrationclient.APIServicesGetter
 
@@ -75,6 +77,7 @@ type AvailableConditionController struct {
 	queue workqueue.RateLimitingInterface
 }
 
+// NewAvailableConditionController returns a new AvailableConditionController.
 func NewAvailableConditionController(
 	apiServiceInformer informers.APIServiceInformer,
 	serviceInformer v1informers.ServiceInformer,
@@ -143,14 +146,18 @@ func (c *AvailableConditionController) sync(key string) error {
 		return err
 	}
 
+	// if a particular transport was specified, use that otherwise build one
 	// construct an http client that will ignore TLS verification (if someone owns the network and messes with your status
-	// that's not so bad) and sets a very short timeout.
+	// that's not so bad) and sets a very short timeout.  This is a best effort GET that provides no additional information
 	restConfig := &rest.Config{
 		TLSClientConfig: rest.TLSClientConfig{
 			Insecure: true,
 			CertData: c.proxyClientCert(),
 			KeyData:  c.proxyClientKey(),
 		},
+	}
+	if c.proxyTransport != nil && c.proxyTransport.DialContext != nil {
+		restConfig.Dial = c.proxyTransport.DialContext
 	}
 	restTransport, err := rest.TransportFor(restConfig)
 	if err != nil {
@@ -160,9 +167,6 @@ func (c *AvailableConditionController) sync(key string) error {
 		Transport: restTransport,
 		// the request should happen quickly.
 		Timeout: 5 * time.Second,
-	}
-	if c.proxyTransport != nil {
-		discoveryClient.Transport = c.proxyTransport
 	}
 
 	apiService := originalAPIService.DeepCopy()
@@ -277,13 +281,14 @@ func (c *AvailableConditionController) sync(key string) error {
 							return
 						}
 					}
+
 					errCh <- err
 				}()
 
 				select {
 				case err = <-errCh:
 					if err != nil {
-						results <- fmt.Errorf("no response from %v: %v", discoveryURL, err)
+						results <- fmt.Errorf("failing or missing response from %v: %v", discoveryURL, err)
 						return
 					}
 
@@ -335,6 +340,7 @@ func updateAPIServiceStatus(client apiregistrationclient.APIServicesGetter, orig
 	if equality.Semantic.DeepEqual(originalAPIService.Status, newAPIService.Status) {
 		return newAPIService, nil
 	}
+
 	newAPIService, err := client.APIServices().UpdateStatus(newAPIService)
 	if err != nil {
 		return nil, err
@@ -360,6 +366,7 @@ func updateAPIServiceStatus(client apiregistrationclient.APIServicesGetter, orig
 	return newAPIService, nil
 }
 
+// Run starts the AvailableConditionController loop which manages the availability condition of API services.
 func (c *AvailableConditionController) Run(threadiness int, stopCh <-chan struct{}) {
 	defer utilruntime.HandleCrash()
 	defer c.queue.ShutDown()

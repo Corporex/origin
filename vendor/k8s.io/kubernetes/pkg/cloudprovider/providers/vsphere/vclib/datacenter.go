@@ -85,6 +85,9 @@ func (dc *Datacenter) GetVMByUUID(ctx context.Context, vmUUID string) (*VirtualM
 // GetHostByVMUUID gets the host object from the given vmUUID
 func (dc *Datacenter) GetHostByVMUUID(ctx context.Context, vmUUID string) (*types.ManagedObjectReference, error) {
 	virtualMachine, err := dc.GetVMByUUID(ctx, vmUUID)
+	if err != nil {
+		return nil, err
+	}
 	var vmMo mo.VirtualMachine
 	pc := property.DefaultCollector(virtualMachine.Client())
 	err = pc.RetrieveOne(ctx, virtualMachine.Reference(), []string{"summary.runtime.host"}, &vmMo)
@@ -145,6 +148,21 @@ func (dc *Datacenter) GetAllDatastores(ctx context.Context) (map[string]*Datasto
 	return dsURLInfoMap, nil
 }
 
+// GetAllHosts returns all the host objects in this datacenter of VC
+func (dc *Datacenter) GetAllHosts(ctx context.Context) ([]types.ManagedObjectReference, error) {
+	finder := getFinder(dc)
+	hostSystems, err := finder.HostSystemList(ctx, "*")
+	if err != nil {
+		klog.Errorf("Failed to get all hostSystems. err: %+v", err)
+		return nil, err
+	}
+	var hostMors []types.ManagedObjectReference
+	for _, hs := range hostSystems {
+		hostMors = append(hostMors, hs.Reference())
+	}
+	return hostMors, nil
+}
+
 // GetDatastoreByPath gets the Datastore object from the given vmDiskPath
 func (dc *Datacenter) GetDatastoreByPath(ctx context.Context, vmDiskPath string) (*Datastore, error) {
 	datastorePathObj := new(object.DatastorePath)
@@ -167,6 +185,28 @@ func (dc *Datacenter) GetDatastoreByName(ctx context.Context, name string) (*Dat
 	}
 	datastore := Datastore{ds, dc}
 	return &datastore, nil
+}
+
+// GetDatastoreInfoByName gets the Datastore object for the given datastore name
+func (dc *Datacenter) GetDatastoreInfoByName(ctx context.Context, name string) (*DatastoreInfo, error) {
+	finder := getFinder(dc)
+	ds, err := finder.Datastore(ctx, name)
+	if err != nil {
+		klog.Errorf("Failed while searching for datastore: %s. err: %+v", name, err)
+		return nil, err
+	}
+	datastore := Datastore{ds, dc}
+	var dsMo mo.Datastore
+	pc := property.DefaultCollector(dc.Client())
+	properties := []string{DatastoreInfoProperty}
+	err = pc.RetrieveOne(ctx, ds.Reference(), properties, &dsMo)
+	if err != nil {
+		klog.Errorf("Failed to get Datastore managed objects from datastore reference."+
+			" dsRef: %+v, err: %+v", ds.Reference(), err)
+		return nil, err
+	}
+	klog.V(9).Infof("Result dsMo: %+v", dsMo)
+	return &DatastoreInfo{Datastore: &datastore, Info: dsMo.Info.GetDatastoreInfo()}, nil
 }
 
 // GetResourcePool gets the resource pool for the given path

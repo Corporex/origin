@@ -43,25 +43,29 @@ import (
 	"github.com/aws/aws-sdk-go/service/elbv2"
 	"github.com/aws/aws-sdk-go/service/kms"
 	"github.com/aws/aws-sdk-go/service/sts"
-	gcfg "gopkg.in/gcfg.v1"
+	"gopkg.in/gcfg.v1"
 	"k8s.io/klog"
 
-	v1 "k8s.io/api/core/v1"
+	"k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/apimachinery/pkg/util/wait"
+	"k8s.io/client-go/informers"
+	informercorev1 "k8s.io/client-go/informers/core/v1"
 	clientset "k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/kubernetes/scheme"
 	v1core "k8s.io/client-go/kubernetes/typed/core/v1"
+	"k8s.io/client-go/pkg/version"
+	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/tools/record"
 	cloudprovider "k8s.io/cloud-provider"
-	"k8s.io/kubernetes/pkg/api/v1/service"
-	"k8s.io/kubernetes/pkg/controller"
-	kubeletapis "k8s.io/kubernetes/pkg/kubelet/apis"
-	"k8s.io/kubernetes/pkg/volume"
-	volumeutil "k8s.io/kubernetes/pkg/volume/util"
+	nodehelpers "k8s.io/cloud-provider/node/helpers"
+	servicehelpers "k8s.io/cloud-provider/service/helpers"
+	cloudvolume "k8s.io/cloud-provider/volume"
+	volerr "k8s.io/cloud-provider/volume/errors"
+	volumehelpers "k8s.io/cloud-provider/volume/helpers"
 )
 
 // NLBHealthCheckRuleDescription is the comment used on a security group rule to
@@ -224,12 +228,12 @@ const (
 	createTagFactor       = 2.0
 	createTagSteps        = 9
 
-	// encryptedCheck* is configuration of poll for created volume to check
-	// it has not been silently removed by AWS.
+	// volumeCreate* is configuration of exponential backoff for created volume.
 	// On a random AWS account (shared among several developers) it took 4s on
-	// average.
-	encryptedCheckInterval = 1 * time.Second
-	encryptedCheckTimeout  = 30 * time.Second
+	// average, 8s max.
+	volumeCreateInitialDelay  = 5 * time.Second
+	volumeCreateBackoffFactor = 1.2
+	volumeCreateBackoffSteps  = 10
 
 	// Number of node names that can be added to a filter. The AWS limit is 200
 	// but we are using a lower limit on purpose
@@ -261,9 +265,6 @@ const DefaultVolumeType = "gp2"
 
 // Used to call recognizeWellKnownRegions just once
 var once sync.Once
-
-// AWS implements PVLabeler.
-var _ cloudprovider.PVLabeler = (*Cloud)(nil)
 
 // Services is an abstraction over AWS, to allow mocking/other implementations
 type Services interface {
@@ -481,6 +482,13 @@ type InstanceGroupInfo interface {
 	CurrentSize() (int, error)
 }
 
+var _ cloudprovider.Interface = (*Cloud)(nil)
+var _ cloudprovider.Instances = (*Cloud)(nil)
+var _ cloudprovider.LoadBalancer = (*Cloud)(nil)
+var _ cloudprovider.Routes = (*Cloud)(nil)
+var _ cloudprovider.Zones = (*Cloud)(nil)
+var _ cloudprovider.PVLabeler = (*Cloud)(nil)
+
 // Cloud is an implementation of Interface, LoadBalancer and Instances for Amazon Web Services.
 type Cloud struct {
 	ec2      EC2
@@ -501,8 +509,13 @@ type Cloud struct {
 
 	instanceCache instanceCache
 
-	clientBuilder    controller.ControllerClientBuilder
-	kubeClient       clientset.Interface
+	clientBuilder cloudprovider.ControllerClientBuilder
+	kubeClient    clientset.Interface
+
+	nodeInformer informercorev1.NodeInformer
+	// Extract the function out to make it easier to test
+	nodeInformerHasSynced cache.InformerSynced
+
 	eventBroadcaster record.EventBroadcaster
 	eventRecorder    record.EventRecorder
 
@@ -681,6 +694,11 @@ func newAWSSDKProvider(creds *credentials.Credentials, cfg *CloudConfig) *awsSDK
 }
 
 func (p *awsSDKProvider) addHandlers(regionName string, h *request.Handlers) {
+	h.Build.PushFrontNamed(request.NamedHandler{
+		Name: "k8s/user-agent",
+		Fn:   request.MakeAddToUserAgentHandler("kubernetes", version.Get().String()),
+	})
+
 	h.Sign.PushFrontNamed(request.NamedHandler{
 		Name: "k8s/logger",
 		Fn:   awsHandlerLogger,
@@ -733,6 +751,14 @@ func (p *awsSDKProvider) getCrossRequestRetryDelay(regionName string) *CrossRequ
 		p.regionDelayers[regionName] = delayer
 	}
 	return delayer
+}
+
+// SetInformers implements InformerUser interface by setting up informer-fed caches for aws lib to
+// leverage Kubernetes API for caching
+func (c *Cloud) SetInformers(informerFactory informers.SharedInformerFactory) {
+	klog.Infof("Setting up informers for Cloud")
+	c.nodeInformer = informerFactory.Core().V1().Nodes()
+	c.nodeInformerHasSynced = c.nodeInformer.Informer().HasSynced
 }
 
 func (p *awsSDKProvider) Compute(regionName string) (EC2, error) {
@@ -1341,14 +1367,17 @@ func (c *Cloud) NodeAddresses(ctx context.Context, name types.NodeName) ([]v1.No
 			addresses = append(addresses, v1.NodeAddress{Type: v1.NodeExternalIP, Address: externalIP})
 		}
 
-		internalDNS, err := c.metadata.GetMetadata("local-hostname")
-		if err != nil || len(internalDNS) == 0 {
+		localHostname, err := c.metadata.GetMetadata("local-hostname")
+		if err != nil || len(localHostname) == 0 {
 			//TODO: It would be nice to be able to determine the reason for the failure,
 			// but the AWS client masks all failures with the same error description.
 			klog.V(4).Info("Could not determine private DNS from AWS metadata.")
 		} else {
-			addresses = append(addresses, v1.NodeAddress{Type: v1.NodeInternalDNS, Address: internalDNS})
-			addresses = append(addresses, v1.NodeAddress{Type: v1.NodeHostName, Address: internalDNS})
+			hostname, internalDNS := parseMetadataLocalHostname(localHostname)
+			addresses = append(addresses, v1.NodeAddress{Type: v1.NodeHostName, Address: hostname})
+			for _, d := range internalDNS {
+				addresses = append(addresses, v1.NodeAddress{Type: v1.NodeInternalDNS, Address: d})
+			}
 		}
 
 		externalDNS, err := c.metadata.GetMetadata("public-hostname")
@@ -1368,6 +1397,26 @@ func (c *Cloud) NodeAddresses(ctx context.Context, name types.NodeName) ([]v1.No
 		return nil, fmt.Errorf("getInstanceByNodeName failed for %q with %q", name, err)
 	}
 	return extractNodeAddresses(instance)
+}
+
+// parseMetadataLocalHostname parses the output of "local-hostname" metadata.
+// If a DHCP option set is configured for a VPC and it has multiple domain names, GetMetadata
+// returns a string containing first the hostname followed by additional domain names,
+// space-separated. For example, if the DHCP option set has:
+// domain-name = us-west-2.compute.internal a.a b.b c.c d.d;
+// $ curl http://169.254.169.254/latest/meta-data/local-hostname
+// ip-192-168-111-51.us-west-2.compute.internal a.a b.b c.c d.d
+func parseMetadataLocalHostname(metadata string) (string, []string) {
+	localHostnames := strings.Fields(metadata)
+	hostname := localHostnames[0]
+	internalDNS := []string{hostname}
+
+	privateAddress := strings.Split(hostname, ".")[0]
+	for _, h := range localHostnames[1:] {
+		internalDNSAddress := privateAddress + "." + h
+		internalDNS = append(internalDNS, internalDNSAddress)
+	}
+	return hostname, internalDNS
 }
 
 // extractNodeAddresses maps the instance information from EC2 to an array of NodeAddresses
@@ -1426,7 +1475,7 @@ func extractNodeAddresses(instance *ec2.Instance) ([]v1.NodeAddress, error) {
 // This method will not be called from the node that is requesting this ID. i.e. metadata service
 // and other local methods cannot be used here
 func (c *Cloud) NodeAddressesByProviderID(ctx context.Context, providerID string) ([]v1.NodeAddress, error) {
-	instanceID, err := kubernetesInstanceID(providerID).mapToAWSInstanceID()
+	instanceID, err := KubernetesInstanceID(providerID).MapToAWSInstanceID()
 	if err != nil {
 		return nil, err
 	}
@@ -1442,7 +1491,7 @@ func (c *Cloud) NodeAddressesByProviderID(ctx context.Context, providerID string
 // InstanceExistsByProviderID returns true if the instance with the given provider id still exists.
 // If false is returned with no error, the instance will be immediately deleted by the cloud controller manager.
 func (c *Cloud) InstanceExistsByProviderID(ctx context.Context, providerID string) (bool, error) {
-	instanceID, err := kubernetesInstanceID(providerID).mapToAWSInstanceID()
+	instanceID, err := KubernetesInstanceID(providerID).MapToAWSInstanceID()
 	if err != nil {
 		return false, err
 	}
@@ -1473,7 +1522,7 @@ func (c *Cloud) InstanceExistsByProviderID(ctx context.Context, providerID strin
 
 // InstanceShutdownByProviderID returns true if the instance is in safe state to detach volumes
 func (c *Cloud) InstanceShutdownByProviderID(ctx context.Context, providerID string) (bool, error) {
-	instanceID, err := kubernetesInstanceID(providerID).mapToAWSInstanceID()
+	instanceID, err := KubernetesInstanceID(providerID).MapToAWSInstanceID()
 	if err != nil {
 		return false, err
 	}
@@ -1529,7 +1578,7 @@ func (c *Cloud) InstanceID(ctx context.Context, nodeName types.NodeName) (string
 // This method will not be called from the node that is requesting this ID. i.e. metadata service
 // and other local methods cannot be used here
 func (c *Cloud) InstanceTypeByProviderID(ctx context.Context, providerID string) (string, error) {
-	instanceID, err := kubernetesInstanceID(providerID).mapToAWSInstanceID()
+	instanceID, err := KubernetesInstanceID(providerID).MapToAWSInstanceID()
 	if err != nil {
 		return "", err
 	}
@@ -1615,7 +1664,7 @@ func (c *Cloud) GetZone(ctx context.Context) (cloudprovider.Zone, error) {
 // This is particularly useful in external cloud providers where the kubelet
 // does not initialize node data.
 func (c *Cloud) GetZoneByProviderID(ctx context.Context, providerID string) (cloudprovider.Zone, error) {
-	instanceID, err := kubernetesInstanceID(providerID).mapToAWSInstanceID()
+	instanceID, err := KubernetesInstanceID(providerID).MapToAWSInstanceID()
 	if err != nil {
 		return cloudprovider.Zone{}, err
 	}
@@ -1696,7 +1745,7 @@ func newAWSInstance(ec2Service EC2, instance *ec2.Instance) *awsInstance {
 
 // Gets the full information about this instance from the EC2 API
 func (i *awsInstance) describeInstance() (*ec2.Instance, error) {
-	return describeInstance(i.ec2, awsInstanceID(i.awsID))
+	return describeInstance(i.ec2, InstanceID(i.awsID))
 }
 
 // Gets the mountDevice already assigned to the volume, or assigns an unused mountDevice.
@@ -1932,7 +1981,7 @@ func (c *Cloud) applyUnSchedulableTaint(nodeName types.NodeName, reason string) 
 		Value:  "true",
 		Effect: v1.TaintEffectNoSchedule,
 	}
-	err := controller.AddOrUpdateTaintOnNode(c.kubeClient, string(nodeName), taint)
+	err := nodehelpers.AddOrUpdateTaintOnNode(c.kubeClient, string(nodeName), taint)
 	if err != nil {
 		klog.Errorf("Error applying taint to node %s with error %v", nodeName, err)
 		return
@@ -2030,7 +2079,7 @@ func (d *awsDisk) deleteVolume() (bool, error) {
 		}
 		if awsError, ok := err.(awserr.Error); ok {
 			if awsError.Code() == "VolumeInUse" {
-				return false, volume.NewDeletedVolumeInUseError(err.Error())
+				return false, volerr.NewDeletedVolumeInUseError(err.Error())
 			}
 		}
 		return false, fmt.Errorf("error deleting EBS volume %q: %q", d.awsID, err)
@@ -2354,8 +2403,13 @@ func (c *Cloud) waitUntilVolumeAvailable(volumeName KubernetesVolumeID) error {
 		// Unreachable code
 		return err
 	}
-
-	err = wait.Poll(encryptedCheckInterval, encryptedCheckTimeout, func() (done bool, err error) {
+	time.Sleep(5 * time.Second)
+	backoff := wait.Backoff{
+		Duration: volumeCreateInitialDelay,
+		Factor:   volumeCreateBackoffFactor,
+		Steps:    volumeCreateBackoffSteps,
+	}
+	err = wait.ExponentialBackoff(backoff, func() (done bool, err error) {
 		vol, err := disk.describeVolume()
 		if err != nil {
 			return true, err
@@ -2428,7 +2482,7 @@ func (c *Cloud) checkIfAvailable(disk *awsDisk, opName string, instance string) 
 			devicePath := aws.StringValue(attachment.Device)
 			nodeName := mapInstanceToNodeName(attachedInstance)
 
-			danglingErr := volumeutil.NewDanglingError(attachErr, nodeName, devicePath)
+			danglingErr := volerr.NewDanglingError(attachErr, nodeName, devicePath)
 			return false, danglingErr
 		}
 
@@ -2441,8 +2495,13 @@ func (c *Cloud) checkIfAvailable(disk *awsDisk, opName string, instance string) 
 
 // GetLabelsForVolume gets the volume labels for a volume
 func (c *Cloud) GetLabelsForVolume(ctx context.Context, pv *v1.PersistentVolume) (map[string]string, error) {
+	// Ignore if not AWSElasticBlockStore.
+	if pv.Spec.AWSElasticBlockStore == nil {
+		return nil, nil
+	}
+
 	// Ignore any volumes that are being provisioned
-	if pv.Spec.AWSElasticBlockStore.VolumeID == volume.ProvisionedVolumeName {
+	if pv.Spec.AWSElasticBlockStore.VolumeID == cloudvolume.ProvisionedVolumeName {
 		return nil, nil
 	}
 
@@ -2471,12 +2530,12 @@ func (c *Cloud) GetVolumeLabels(volumeName KubernetesVolumeID) (map[string]strin
 		return nil, fmt.Errorf("volume did not have AZ information: %q", aws.StringValue(info.VolumeId))
 	}
 
-	labels[kubeletapis.LabelZoneFailureDomain] = az
+	labels[v1.LabelZoneFailureDomain] = az
 	region, err := azToRegion(az)
 	if err != nil {
 		return nil, err
 	}
-	labels[kubeletapis.LabelZoneRegion] = region
+	labels[v1.LabelZoneRegion] = region
 
 	return labels, nil
 }
@@ -2602,7 +2661,7 @@ func (c *Cloud) ResizeDisk(
 		return oldSize, descErr
 	}
 	// AWS resizes in chunks of GiB (not GB)
-	requestGiB := volumeutil.RoundUpToGiB(newSize)
+	requestGiB := volumehelpers.RoundUpToGiB(newSize)
 	newSizeQuant := resource.MustParse(fmt.Sprintf("%dGi", requestGiB))
 
 	// If disk already if of greater or equal size than requested we return
@@ -3432,7 +3491,7 @@ func (c *Cloud) EnsureLoadBalancer(ctx context.Context, clusterName string, apiS
 		return nil, err
 	}
 
-	sourceRanges, err := service.GetLoadBalancerSourceRanges(apiService)
+	sourceRanges, err := servicehelpers.GetLoadBalancerSourceRanges(apiService)
 	if err != nil {
 		return nil, err
 	}
@@ -3448,7 +3507,7 @@ func (c *Cloud) EnsureLoadBalancer(ctx context.Context, clusterName string, apiS
 
 	if isNLB(annotations) {
 
-		if path, healthCheckNodePort := service.GetServiceHealthCheckPathPort(apiService); path != "" {
+		if path, healthCheckNodePort := servicehelpers.GetServiceHealthCheckPathPort(apiService); path != "" {
 			for i := range v2Mappings {
 				v2Mappings[i].HealthCheckPort = int64(healthCheckNodePort)
 				v2Mappings[i].HealthCheckPath = path
@@ -3706,7 +3765,7 @@ func (c *Cloud) EnsureLoadBalancer(ctx context.Context, clusterName string, apiS
 		}
 	}
 
-	if path, healthCheckNodePort := service.GetServiceHealthCheckPathPort(apiService); path != "" {
+	if path, healthCheckNodePort := servicehelpers.GetServiceHealthCheckPathPort(apiService); path != "" {
 		klog.V(4).Infof("service %v (%v) needs health checks on :%d%s)", apiService.Name, loadBalancerName, healthCheckNodePort, path)
 		err = c.ensureLoadBalancerHealthCheck(loadBalancer, "HTTP", healthCheckNodePort, path, annotations)
 		if err != nil {
@@ -3723,8 +3782,15 @@ func (c *Cloud) EnsureLoadBalancer(ctx context.Context, clusterName string, apiS
 			tcpHealthCheckPort = int32(*listener.InstancePort)
 			break
 		}
+		annotationProtocol := strings.ToLower(annotations[ServiceAnnotationLoadBalancerBEProtocol])
+		var hcProtocol string
+		if annotationProtocol == "https" || annotationProtocol == "ssl" {
+			hcProtocol = "SSL"
+		} else {
+			hcProtocol = "TCP"
+		}
 		// there must be no path on TCP health check
-		err = c.ensureLoadBalancerHealthCheck(loadBalancer, "TCP", tcpHealthCheckPort, "", annotations)
+		err = c.ensureLoadBalancerHealthCheck(loadBalancer, hcProtocol, tcpHealthCheckPort, "", annotations)
 		if err != nil {
 			return nil, err
 		}
@@ -3889,7 +3955,7 @@ func (c *Cloud) getTaggedSecurityGroups() (map[string]*ec2.SecurityGroup, error)
 
 // Open security group ingress rules on the instances so that the load balancer can talk to them
 // Will also remove any security groups ingress rules for the load balancer that are _not_ needed for allInstances
-func (c *Cloud) updateInstanceSecurityGroupsForLoadBalancer(lb *elb.LoadBalancerDescription, instances map[awsInstanceID]*ec2.Instance) error {
+func (c *Cloud) updateInstanceSecurityGroupsForLoadBalancer(lb *elb.LoadBalancerDescription, instances map[InstanceID]*ec2.Instance) error {
 	if c.cfg.Global.DisableSecurityGroupIngress {
 		return nil
 	}
@@ -4203,18 +4269,39 @@ func (c *Cloud) EnsureLoadBalancerDeleted(ctx context.Context, clusterName strin
 		// Note that this is annoying: the load balancer disappears from the API immediately, but it is still
 		// deleting in the background.  We get a DependencyViolation until the load balancer has deleted itself
 
+		var loadBalancerSGs = aws.StringValueSlice(lb.SecurityGroups)
+
+		describeRequest := &ec2.DescribeSecurityGroupsInput{}
+		filters := []*ec2.Filter{
+			newEc2Filter("group-id", loadBalancerSGs...),
+		}
+		describeRequest.Filters = c.tagging.addFilters(filters)
+		response, err := c.ec2.DescribeSecurityGroups(describeRequest)
+		if err != nil {
+			return fmt.Errorf("error querying security groups for ELB: %q", err)
+		}
+
 		// Collect the security groups to delete
 		securityGroupIDs := map[string]struct{}{}
-		for _, securityGroupID := range lb.SecurityGroups {
-			if *securityGroupID == c.cfg.Global.ElbSecurityGroup {
-				//We don't want to delete a security group that was defined in the Cloud Configurationn.
+
+		for _, sg := range response {
+			sgID := aws.StringValue(sg.GroupId)
+
+			if sgID == c.cfg.Global.ElbSecurityGroup {
+				//We don't want to delete a security group that was defined in the Cloud Configuration.
 				continue
 			}
-			if aws.StringValue(securityGroupID) == "" {
-				klog.Warning("Ignoring empty security group in ", service.Name)
+			if sgID == "" {
+				klog.Warningf("Ignoring empty security group in %s", service.Name)
 				continue
 			}
-			securityGroupIDs[*securityGroupID] = struct{}{}
+
+			if !c.tagging.hasClusterTag(sg.Tags) {
+				klog.Warningf("Ignoring security group with no cluster tag in %s", service.Name)
+				continue
+			}
+
+			securityGroupIDs[sgID] = struct{}{}
 		}
 
 		// Loop through and try to delete them
@@ -4465,7 +4552,18 @@ func (c *Cloud) findInstanceByNodeName(nodeName types.NodeName) (*ec2.Instance, 
 // Returns the instance with the specified node name
 // Like findInstanceByNodeName, but returns error if node not found
 func (c *Cloud) getInstanceByNodeName(nodeName types.NodeName) (*ec2.Instance, error) {
-	instance, err := c.findInstanceByNodeName(nodeName)
+	var instance *ec2.Instance
+
+	// we leverage node cache to try to retrieve node's provider id first, as
+	// get instance by provider id is way more efficient than by filters in
+	// aws context
+	awsID, err := c.nodeNameToProviderID(nodeName)
+	if err != nil {
+		klog.V(3).Infof("Unable to convert node name %q to aws instanceID, fall back to findInstanceByNodeName: %v", nodeName, err)
+		instance, err = c.findInstanceByNodeName(nodeName)
+	} else {
+		instance, err = c.getInstanceByID(string(awsID))
+	}
 	if err == nil && instance == nil {
 		return nil, cloudprovider.InstanceNotFound
 	}
@@ -4483,6 +4581,26 @@ func (c *Cloud) getFullInstance(nodeName types.NodeName) (*awsInstance, *ec2.Ins
 	}
 	awsInstance := newAWSInstance(c.ec2, instance)
 	return awsInstance, instance, err
+}
+
+func (c *Cloud) nodeNameToProviderID(nodeName types.NodeName) (InstanceID, error) {
+	if len(nodeName) == 0 {
+		return "", fmt.Errorf("no nodeName provided")
+	}
+
+	if c.nodeInformerHasSynced == nil || !c.nodeInformerHasSynced() {
+		return "", fmt.Errorf("node informer has not synced yet")
+	}
+
+	node, err := c.nodeInformer.Lister().Get(string(nodeName))
+	if err != nil {
+		return "", err
+	}
+	if len(node.Spec.ProviderID) == 0 {
+		return "", fmt.Errorf("node has no providerID")
+	}
+
+	return KubernetesInstanceID(node.Spec.ProviderID).MapToAWSInstanceID()
 }
 
 func setNodeDisk(

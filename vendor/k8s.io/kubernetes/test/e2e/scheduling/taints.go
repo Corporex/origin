@@ -26,13 +26,12 @@ import (
 
 	"k8s.io/client-go/tools/cache"
 
+	. "github.com/onsi/ginkgo"
+	_ "github.com/stretchr/testify/assert"
 	"k8s.io/api/core/v1"
 	clientset "k8s.io/client-go/kubernetes"
 	"k8s.io/kubernetes/test/e2e/framework"
 	testutils "k8s.io/kubernetes/test/utils"
-
-	. "github.com/onsi/ginkgo"
-	_ "github.com/stretchr/testify/assert"
 )
 
 func getTestTaint() v1.Taint {
@@ -45,7 +44,7 @@ func getTestTaint() v1.Taint {
 	}
 }
 
-// Creates a defaut pod for this test, with argument saying if the Pod should have
+// Create a default pod for this test, with argument saying if the Pod should have
 // toleration for Taits used in this test.
 func createPodForTaintsTest(hasToleration bool, tolerationSeconds int, podName, podLabel, ns string) *v1.Pod {
 	grace := int64(1)
@@ -358,6 +357,9 @@ var _ = SIGDescribe("NoExecuteTaintManager Multiple Pods [Serial]", func() {
 		framework.Logf("Pod1 is running on %v. Tainting Node", nodeName1)
 		nodeName2, err := testutils.RunPodAndGetNodeName(cs, pod2, 2*time.Minute)
 		framework.ExpectNoError(err)
+		// Wait for pods to be running state before eviction happens
+		framework.ExpectNoError(framework.WaitForPodRunningInNamespace(cs, pod1))
+		framework.ExpectNoError(framework.WaitForPodRunningInNamespace(cs, pod2))
 		framework.Logf("Pod2 is running on %v. Tainting Node", nodeName2)
 
 		By("Trying to apply a taint on the Nodes")

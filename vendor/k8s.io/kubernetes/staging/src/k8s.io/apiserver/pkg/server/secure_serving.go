@@ -23,7 +23,6 @@ import (
 	"fmt"
 	"net"
 	"net/http"
-	"os"
 	"strings"
 	"time"
 
@@ -60,14 +59,6 @@ func (s *SecureServingInfo) Serve(handler http.Handler, shutdownTimeout time.Dur
 		MinVersion: tls.VersionTLS12,
 		// enable HTTP2 for go's 1.7 HTTP Server
 		NextProtos: []string{"h2", "http/1.1"},
-	}
-
-	if s.HTTP1Only {
-		klog.Info("Forcing use of http/1.1 only")
-		if err := os.Setenv("GODEBUG", "http2server=0"); err != nil {
-			return nil, err
-		}
-		baseTLSConfig.NextProtos = []string{"http/1.1"}
 	}
 
 	if s.MinTLSVersion > 0 {
@@ -126,11 +117,9 @@ func (s *SecureServingInfo) Serve(handler http.Handler, shutdownTimeout time.Dur
 	// increase the connection buffer size from the 1MB default to handle the specified number of concurrent streams
 	http2Options.MaxUploadBufferPerConnection = http2Options.MaxUploadBufferPerStream * int32(http2Options.MaxConcurrentStreams)
 
-	if !s.HTTP1Only {
-		// apply settings to the server
-		if err := http2.ConfigureServer(secureServer, http2Options); err != nil {
-			return nil, fmt.Errorf("error configuring http2: %v", err)
-		}
+	// apply settings to the server
+	if err := http2.ConfigureServer(secureServer, http2Options); err != nil {
+		return nil, fmt.Errorf("error configuring http2: %v", err)
 	}
 
 	klog.Infof("Serving securely on %s", secureServer.Addr)
@@ -193,12 +182,12 @@ type NamedTLSCert struct {
 
 	TLSCert tls.Certificate
 
-	// names is a list of domain patterns: fully qualified domain names, possibly prefixed with
+	// Names is a list of domain patterns: fully qualified domain names, possibly prefixed with
 	// wildcard segments.
 	Names []string
 }
 
-// getNamedCertificateMap returns a map of *tls.Certificate by name. It's is
+// GetNamedCertificateMap returns a map of *tls.Certificate by name. It's
 // suitable for use in tls.Config#NamedCertificates. Returns an error if any of the certs
 // cannot be loaded. Returns nil if len(certs) == 0
 func GetNamedCertificateMap(certs []NamedTLSCert) (map[string]*tls.Certificate, map[string]*servercerts.CertKeyFileReference, error) {
